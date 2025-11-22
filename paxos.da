@@ -85,6 +85,7 @@ class Client(process):
 class Node(process):
     def setup(node_name:str, peers:set, is_initial_leader:bool):
         self.node_name = node_name
+        self.cluster_size = len(peers)  # Total cluster size for quorum checks
         self.peers = peers - {self}
         
         # Paxos state
@@ -320,8 +321,8 @@ class Node(process):
         
         self.accepted_votes[key].add(node)
         
-        # Check for majority
-        if len(self.accepted_votes[key]) > len(self.peers) / 2:
+        # Check for majority (need > half of TOTAL cluster, not just current peers)
+        if len(self.accepted_votes[key]) > self.cluster_size / 2:
             # Commit
             send(('COMMIT', b, seq, val), to=self.peers)
             output(f"Leader {self.node_name} committing {seq}")
@@ -479,7 +480,7 @@ def main():
     node_map = {name: node for name, node in zip(node_names, nodes_list)}
     
     # Read CSV file
-    csv_file = 'CSE535-F25-Project-1-Demo-Tests.csv'
+    csv_file = 'CSE535-F25-Project-1-Testcases.csv'
     
     test_sets = []
     current_set = None
