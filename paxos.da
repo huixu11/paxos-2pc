@@ -1,0 +1,552 @@
+import sys
+import time
+import csv
+import random
+
+# Configuration
+TIMEOUT = 5.0
+HEARTBEAT_INTERVAL = 0.5
+HEARTBEAT_TIMEOUT = 3.0
+
+# Helper Functions
+def parse_transaction(tx_str):
+    """Parse transaction string like '(A, B, 10)' or '(A)'"""
+    if not tx_str or tx_str.strip() == '': 
+        return None
+    tx_str = tx_str.strip().strip('()')
+    parts = [p.strip() for p in tx_str.split(',')]
+    if len(parts) == 3:
+        return (parts[0], parts[1], int(parts[2]))
+    elif len(parts) == 1:
+        return (parts[0],)
+    return None
+
+def parse_live_nodes(nodes_str):
+    """Parse live nodes string like '[n1, n2, n3]'"""
+    if not nodes_str or nodes_str.strip() == '':
+        return []
+    nodes_str = nodes_str.strip().strip('[]')
+    return [n.strip() for n in nodes_str.split(',')]
+
+# Client Process
+class Client(process):
+    def setup(client_id:int, nodes:set, initial_leader):
+        self.client_id = client_id
+        self.nodes = nodes
+        self.leader = initial_leader
+        self.request_id = 0
+        self.pending = None  # (req_id, tx, timestamp)
+        output(f"Client {client_id} setup with leader {initial_leader}")
+    
+    def run():
+        output("Client started running")
+        await(some(received(('DONE',))))
+        output("Client finishing")
+    
+    def receive(msg=('TRIGGER_TX', tx), from_=parent):
+        output(f"Client triggered for {tx}")
+        result = request_transaction(tx)
+        send(('TX_RESULT', tx, result), to=parent)
+    
+    def request_transaction(tx):
+        self.request_id += 1
+        req_id = (self.client_id, self.request_id)
+        timestamp = time.time()
+        self.pending = (req_id, tx, timestamp)
+        
+        # Send to leader
+        output(f"Client sending {req_id} to {self.leader}")
+        send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id), to=self.leader)
+        
+        # Wait for reply with timeout
+        if await(some(received(('CLIENT_REPLY', r_id, _), from_=sender_proc), has= r_id == req_id)):
+            replies = setof((p, res), received(('CLIENT_REPLY', r_id, res), from_=p), r_id == req_id)
+            new_leader, result = replies.pop()
+            self.leader = new_leader
+            self.pending = None
+            return result
+        elif timeout(TIMEOUT):
+            output("Client timeout, broadcasting...")
+            # Broadcast to all nodes on timeout
+            send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id), to=self.nodes)
+            
+            # Wait again
+            if await(some(received(('CLIENT_REPLY', r_id, _), from_=sender_proc), has= r_id == req_id)):
+                replies = setof((p, res), received(('CLIENT_REPLY', r_id, res), from_=p), r_id == req_id)
+                new_leader, result = replies.pop()
+                self.leader = new_leader
+                self.pending = None
+                return result
+            elif timeout(TIMEOUT * 2):
+                self.pending = None
+                return "TIMEOUT"
+
+# Node Process
+class Node(process):
+    def setup(node_name:str, peers:set, is_initial_leader:bool):
+        self.node_name = node_name
+        self.peers = peers - {self}
+        
+        # Paxos state
+        self.is_initial_leader = is_initial_leader
+        self.ballot_num = (1, self) if is_initial_leader else (0, self)
+        self.status = 'LEADER' if is_initial_leader else 'FOLLOWER'
+        self.leader = self if is_initial_leader else None
+        
+        # Logs
+        self.accept_log = set()  # Set of (ballot, seq, val)
+        self.committed_log = {}  # seq -> val
+        
+        # Leader election
+        self.promises = {}  # ballot -> {node -> accept_log}
+        self.accepted_votes = {}  # (ballot, seq) -> set of nodes
+        
+        # Sequence numbers
+        self.next_seq = 1
+        self.last_executed_seq = 0
+        
+        # Database
+        self.db = {}  # client_id -> balance (default 10)
+        self.known_clients = set()  # Track all clients seen
+
+        
+        # Client tracking for exactly-once
+        self.client_replies = {}  # (client_id, req_id) -> result
+        
+        # Failure state
+        self.is_failed = False
+        
+        # For PrintView
+        self.new_view_messages = []
+        
+        # Heartbeat
+        self.last_heartbeat = time.time()
+    
+    def run():
+        while True:
+            if self.is_failed:
+                await(not self.is_failed)
+                continue
+            
+            # Leader sends heartbeats
+            if self.status == 'LEADER':
+                send(('HEARTBEAT', self.ballot_num), to=self.peers)
+                
+                if await(some(received(_))):
+                    pass
+                elif timeout(HEARTBEAT_INTERVAL):
+                    pass
+            
+            # Follower checks for heartbeat timeout
+            elif self.status == 'FOLLOWER':
+                old_hb = self.last_heartbeat
+                # Add random jitter to prevent livelock (dueling leaders)
+                jitter = random.uniform(0, 2.0)
+                to_wait = (HEARTBEAT_TIMEOUT + jitter) - (time.time() - old_hb)
+                if to_wait < 0: to_wait = 0
+                
+                if await(self.last_heartbeat > old_hb):
+                    pass
+                elif timeout(to_wait):
+                    output(f"Follower {self.node_name} timed out! Starting election.")
+                    # Start election
+                    start_election()
+            
+            else:  # CANDIDATE
+                await(some(received(_)))
+    
+    # === Leader Election ===
+    
+    def start_election():
+        output(f"{self.node_name} starting election")
+        if self.is_failed:
+            return
+        
+        self.status = 'CANDIDATE'
+        self.ballot_num = (self.ballot_num[0] + 1, self)
+        self.promises[self.ballot_num] = {}
+        
+        send(('PREPARE', self.ballot_num), to=self.peers)
+    
+    def receive(msg=('PREPARE', b), from_=p):
+        if self.is_failed:
+            return
+        
+        if b > self.ballot_num:
+            self.ballot_num = b
+            self.status = 'FOLLOWER'
+            self.leader = p
+            send(('ACK', b, self.accept_log), to=p)
+    
+    def receive(msg=('ACK', b, acc_log), from_=p):
+        if self.is_failed or self.status != 'CANDIDATE' or b != self.ballot_num:
+            return
+        
+        self.promises[b][p] = acc_log
+        
+        # Check for majority
+        if len(self.promises[b]) >= len(self.peers) / 2:
+            become_leader()
+    
+    def become_leader():
+        self.status = 'LEADER'
+        self.leader = self
+        
+        # Construct NEW-VIEW
+        all_entries = set()
+        for log in self.promises[self.ballot_num].values():
+            all_entries.update(log)
+        all_entries.update(self.accept_log)
+        
+        # Find max sequence number
+        max_seq = max([e[1] for e in all_entries]) if all_entries else 0
+        
+        # Fill gaps with no-op
+        new_log = set()
+        for s in range(1, max_seq + 1):
+            entries_at_s = [e for e in all_entries if e[1] == s]
+            if entries_at_s:
+                best = max(entries_at_s)  # Highest ballot
+                new_log.add((self.ballot_num, s, best[2]))
+            else:
+                new_log.add((self.ballot_num, s, 'NO-OP'))
+        
+        self.accept_log = new_log
+        self.next_seq = max_seq + 1
+        
+        # Vote for own proposals in NEW-VIEW
+        for (ballot, seq, val) in new_log:
+            key = (ballot, seq)
+            if key not in self.accepted_votes:
+                self.accepted_votes[key] = set()
+            self.accepted_votes[key].add(self)
+        
+        # Send NEW-VIEW
+        nv_msg = ('NEW-VIEW', self.ballot_num, new_log)
+        self.new_view_messages.append(nv_msg)
+        send(nv_msg, to=self.peers)
+    
+    def receive(msg=('NEW-VIEW', b, new_log), from_=leader):
+        if self.is_failed:
+            return
+        
+        if b >= self.ballot_num:
+            self.ballot_num = b
+            self.status = 'FOLLOWER'
+            self.leader = leader
+            self.accept_log = new_log
+            self.new_view_messages.append(('NEW-VIEW', b, new_log))
+            
+            # Send ACCEPTED for all entries
+            for (ballot, seq, val) in new_log:
+                send(('ACCEPTED', ballot, seq, val, self), to=leader)
+    
+    # === Heartbeat ===
+    
+    def receive(msg=('HEARTBEAT', b), from_=leader):
+        if self.is_failed:
+            return
+        
+        if b >= self.ballot_num:
+            self.ballot_num = b
+            self.status = 'FOLLOWER'
+            self.leader = leader
+            self.last_heartbeat = time.time()
+            # output(f"{self.node_name} received HEARTBEAT from {leader}")
+    
+    # === Normal Operations ===
+    
+    def receive(msg=('CLIENT_REQUEST', tx, timestamp, cid, req_id), from_=client):
+        if self.is_failed:
+            return
+        
+        output(f"{self.node_name} received REQUEST {req_id} from client")
+        
+        # Check if already processed
+        if (cid, req_id) in self.client_replies:
+            client_proc, result = self.client_replies[(cid, req_id)]
+            send(('CLIENT_REPLY', req_id, result), to=client_proc)
+            return
+        
+        # Forward to leader if not leader
+        if self.status != 'LEADER':
+            if self.leader:
+                send(('CLIENT_REQUEST', tx, timestamp, cid, req_id), to=self.leader)
+            return
+        
+        # Leader: propose transaction
+        seq = self.next_seq
+        self.next_seq += 1
+        
+        # Store client process in value so we can reply later
+        val = (tx, timestamp, cid, req_id, client)
+        self.accept_log.add((self.ballot_num, seq, val))
+        
+        send(('ACCEPT', self.ballot_num, seq, val), to=self.peers)
+        output(f"Leader {self.node_name} proposed {seq}")
+        # Self-vote
+        send(('ACCEPTED', self.ballot_num, seq, val, self), to=self)
+    
+    def receive(msg=('ACCEPT', b, seq, val), from_=leader):
+        if self.is_failed:
+            return
+        
+        if b >= self.ballot_num:
+            self.ballot_num = b
+            self.leader = leader
+            self.accept_log.add((b, seq, val))
+            send(('ACCEPTED', b, seq, val, self), to=leader)
+            output(f"{self.node_name} accepted {seq} from {leader}")
+    
+    def receive(msg=('ACCEPTED', b, seq, val, node), from_=_):
+        if self.is_failed or self.status != 'LEADER' or b != self.ballot_num:
+            return
+        
+        key = (b, seq)
+        if key not in self.accepted_votes:
+            self.accepted_votes[key] = set()
+        
+        self.accepted_votes[key].add(node)
+        
+        # Check for majority
+        if len(self.accepted_votes[key]) > len(self.peers) / 2:
+            # Commit
+            send(('COMMIT', b, seq, val), to=self.peers)
+            output(f"Leader {self.node_name} committing {seq}")
+            # Self-commit
+            handle_commit(b, seq, val)
+    
+    def receive(msg=('COMMIT', b, seq, val), from_=_):
+        if self.is_failed:
+            return
+        
+        handle_commit(b, seq, val)
+    
+    def handle_commit(b, seq, val):
+        self.committed_log[seq] = val
+        execute_committed()
+    
+    def execute_committed():
+        """Execute all committed transactions in order"""
+        while self.last_executed_seq + 1 in self.committed_log:
+            seq = self.last_executed_seq + 1
+            val = self.committed_log[seq]
+            
+            if val == 'NO-OP':
+                self.last_executed_seq = seq
+                continue
+            
+            # val is (tx, timestamp, cid, req_id, client_proc)
+            tx, timestamp, cid, req_id, client_proc = val
+            
+            # Execute transaction
+            if len(tx) == 3:  # Transfer (sender, receiver, amount)
+                sender, receiver, amount = tx
+                self.known_clients.add(sender)
+                self.known_clients.add(receiver)
+                output(f"Executing {tx} on {self.node_name}")
+                
+                sender_bal = self.db.get(sender, 10)
+                receiver_bal = self.db.get(receiver, 10)
+                
+                if sender_bal >= amount:
+                    self.db[sender] = sender_bal - amount
+                    self.db[receiver] = receiver_bal + amount
+                    result = "SUCCESS"
+                else:
+                    result = "INSUFFICIENT_FUNDS"
+            
+            elif len(tx) == 1:  # Balance query
+                client_id = tx[0]
+                self.known_clients.add(client_id)
+                balance = self.db.get(client_id, 10)
+                result = f"BALANCE:{balance}"
+            
+            else:
+                result = "UNKNOWN_TX"
+            
+            # Store result for exactly-once (store client_proc and result)
+            self.client_replies[(cid, req_id)] = (client_proc, result)
+            
+            # Send reply if leader
+            if self.status == 'LEADER':
+                send(('CLIENT_REPLY', req_id, result), to=client_proc)
+            
+            self.last_executed_seq = seq
+    
+    # === Failure Handling ===
+    
+    def receive(msg=('FAIL',)):
+        self.is_failed = True
+        
+    def receive(msg=('FAIL_LEADER',)):
+        if self.status == 'LEADER':
+            self.is_failed = True
+            output(f"{self.node_name} (LEADER) FAILED by LF command")
+    
+    def receive(msg=('RECOVER',)):
+        self.is_failed = False
+        # Do not start election immediately - wait for heartbeat timeout
+        # if self.status != 'LEADER':
+        #     start_election()
+    
+    def receive(msg=('RESET',)):
+        output(f"{self.node_name} RESET. Peers: {len(self.peers)}")
+        self.ballot_num = (1, self) if self.is_initial_leader else (0, self)
+        self.status = 'LEADER' if self.is_initial_leader else 'FOLLOWER'
+        self.leader = self if self.is_initial_leader else None
+        self.accept_log = set()
+        self.committed_log = {}
+        self.promises = {}
+        self.accepted_votes = {}
+        self.next_seq = 1
+        self.last_executed_seq = 0
+        # self.db = {}  # Preserved for Project 1
+        # self.known_clients = set() # Preserved for Project 1
+        self.client_replies = {}
+        self.is_failed = False
+        self.new_view_messages = []
+    
+    # === Print Functions ===
+    
+    def receive(msg=('PRINT_BALANCE', client_id)):
+        balance = self.db.get(client_id, 10)
+        output(f'{self.node_name}: {balance}')
+    
+    def receive(msg=('PRINT_DB',)):
+        # Print all known clients
+        sorted_clients = sorted(list(self.known_clients))
+        items = []
+        for c in sorted_clients:
+            items.append(f"{c}:{self.db.get(c, 10)}")
+        output(f'{self.node_name} DB ({len(self.known_clients)}): {", ".join(items)}')
+    
+    def receive(msg=('PRINT_LOG',)):
+        output(f'{self.node_name} Log: {sorted(self.accept_log)}')
+    
+    def receive(msg=('PRINT_STATUS', seq)):
+        if seq in self.committed_log:
+            if seq <= self.last_executed_seq:
+                status = 'E'
+            else:
+                status = 'C'
+        elif any(e[1] == seq for e in self.accept_log):
+            status = 'A'
+        else:
+            status = 'X'
+        output(f'{self.node_name}: {status}')
+    
+    def receive(msg=('PRINT_VIEW',)):
+        for nv in self.new_view_messages:
+            output(f'{self.node_name} View: {nv}')
+
+# Main Function
+def main():
+    # Setup 5 nodes
+    node_names = ['n1', 'n2', 'n3', 'n4', 'n5']
+    nodes = new(Node, num=5)
+    nodes_list = list(nodes)
+    
+    for i, node in enumerate(nodes_list):
+        setup(node, (node_names[i], set(nodes_list), i == 0))
+    
+    start(nodes)
+    
+    # Map node names to processes
+    node_map = {name: node for name, node in zip(node_names, nodes_list)}
+    
+    # Read CSV file
+    csv_file = 'CSE535-F25-Project-1-Demo-Tests.csv'
+    
+    test_sets = []
+    current_set = None
+    
+    with open(csv_file, 'r') as f:
+        reader = csv.reader(f)
+        next(reader)  # Skip header
+        
+        for row in reader:
+            if not row or len(row) < 2:
+                continue
+            
+            set_num, tx_str = row[0], row[1]
+            live_nodes_str = row[2] if len(row) > 2 else ''
+            
+            if set_num and set_num.strip():
+                if current_set:
+                    test_sets.append(current_set)
+                
+                current_set = {
+                    'id': set_num,
+                    'transactions': [],
+                    'live_nodes': parse_live_nodes(live_nodes_str) if live_nodes_str else []
+                }
+            
+            if tx_str and tx_str.strip():
+                if tx_str.strip().startswith('F('):
+                    node_name = tx_str.strip()[2:-1]
+                    current_set['transactions'].append(('FAIL', node_name))
+                elif tx_str.strip().startswith('R('):
+                    node_name = tx_str.strip()[2:-1]
+                    current_set['transactions'].append(('RECOVER', node_name))
+                else:
+                    tx = parse_transaction(tx_str)
+                    if tx:
+                        current_set['transactions'].append(('TX', tx))
+        
+        if current_set:
+            test_sets.append(current_set)
+    
+    # Create client
+    client = new(Client, num=1)
+    setup(client, (0, set(nodes_list), nodes_list[0]))
+    start(client)
+    
+    # Run test sets
+    for test_set in test_sets:
+        output(f"\n=== Processing Set {test_set['id']} ===")
+        
+        # Reset all nodes - Keep DB, reset consensus
+        # send(('RESET',), to=nodes)
+        # time.sleep(0.5)
+        
+        # Handle live nodes
+        if test_set['live_nodes']:
+            for name in node_names:
+                if name in test_set['live_nodes']:
+                    send(('RECOVER',), to=node_map[name])
+                else:
+                    send(('FAIL',), to=node_map[name])
+        
+        # Process transactions
+        for tx_type, tx_data in test_set['transactions']:
+            if tx_type == 'FAIL':
+                send(('FAIL',), to=node_map[tx_data])
+            elif tx_type == 'RECOVER':
+                send(('RECOVER',), to=node_map[tx_data])
+            elif tx_type == 'TX':
+                if tx_data == ('LF',):
+                    output("Executing LF (Leader Fail)")
+                    # Fail n1 explicitly (node at index 0)
+                    send(('FAIL',), to=nodes_list[0])
+                    time.sleep(1.0) # Wait for failure to take effect
+                    continue
+                
+                send(('TRIGGER_TX', tx_data), to=client)
+                
+                # Wait for result
+                # Wait for result
+                if await(some(received(('TX_RESULT', tx_val, _)), has= tx_val == tx_data)):
+                    results = setof((t, r), received(('TX_RESULT', t, r)), t == tx_data)
+                    _, result = results.pop()
+                    output(f"Tx {tx_data} -> {result}")
+                elif timeout(5.0):
+                    output(f"Tx {tx_data} -> TIMEOUT")
+        
+        # Print DB
+        output(f"\n=== End of Set {test_set['id']} ===")
+        send(('PRINT_DB',), to=nodes)
+        time.sleep(0.5)
+    
+    # Cleanup
+    send(('DONE',), to=client)
