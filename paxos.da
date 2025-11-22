@@ -111,7 +111,8 @@ class Node(process):
 
         
         # Client tracking for exactly-once
-        self.client_replies = {}  # (client_id, req_id) -> result
+        self.client_replies = {}  # (client_id, req_id) -> (client_proc, result)
+        self.pending_requests = set()  # Set of (client_id, req_id) being processed
         
         # Failure state
         self.is_failed = False
@@ -221,6 +222,8 @@ class Node(process):
                 self.accepted_votes[key] = set()
             self.accepted_votes[key].add(self)
         
+        output(f"Leader {self.node_name} NEW-VIEW: {len(new_log)} entries, seq range 1-{max_seq}")
+        
         # Send NEW-VIEW
         nv_msg = ('NEW-VIEW', self.ballot_num, new_log)
         self.new_view_messages.append(nv_msg)
@@ -231,6 +234,7 @@ class Node(process):
             return
         
         if b >= self.ballot_num:
+            output(f"{self.node_name} received NEW-VIEW from {leader}: {len(new_log)} entries")
             self.ballot_num = b
             self.status = 'FOLLOWER'
             self.leader = leader
@@ -273,6 +277,14 @@ class Node(process):
             if self.leader:
                 send(('CLIENT_REQUEST', tx, timestamp, cid, req_id), to=self.leader)
             return
+        
+        # Check if already being processed (pending)
+        if (cid, req_id) in self.pending_requests:
+            output(f"Leader {self.node_name} ignoring duplicate REQUEST {req_id}")
+            return
+        
+        # Mark as pending
+        self.pending_requests.add((cid, req_id))
         
         # Leader: propose transaction
         seq = self.next_seq
@@ -323,7 +335,13 @@ class Node(process):
         handle_commit(b, seq, val)
     
     def handle_commit(b, seq, val):
+        # Skip if already executed (happens during NEW-VIEW sync)
+        if seq <= self.last_executed_seq:
+            output(f"{self.node_name} SKIPPING already-executed seq={seq}")
+            return
+        
         self.committed_log[seq] = val
+        output(f"{self.node_name} COMMITTED seq={seq}")
         execute_committed()
     
     def execute_committed():
@@ -365,8 +383,13 @@ class Node(process):
             else:
                 result = "UNKNOWN_TX"
             
+            output(f"{self.node_name} EXECUTED seq={seq}, tx={tx}, result={result}")
+            
             # Store result for exactly-once (store client_proc and result)
             self.client_replies[(cid, req_id)] = (client_proc, result)
+            
+            # Remove from pending set
+            self.pending_requests.discard((cid, req_id))
             
             # Send reply if leader
             if self.status == 'LEADER':
