@@ -236,8 +236,20 @@ class Node(process):
         for seq, val in self.committed_log.items():
             all_entries.add((self.ballot_num, seq, val))
         
-        # Find max sequence number
+        # Find max sequence number from all sources (accepted AND committed)
+        # This ensures we cover any sequences that were proposed but not committed
         max_seq = max([e[1] for e in all_entries]) if all_entries else 0
+        
+        # IMPORTANT: Also check the highest sequence in ANY peer's accept_log
+        # This handles the case where a previous leader proposed seq=N but crashed
+        # before anyone committed it. We must include seq=N in NEW-VIEW (as No-Op if empty)
+        for (acc_log, comm_log, last_exec) in self.promises[self.ballot_num].values():
+            if acc_log:
+                peer_max = max([e[1] for e in acc_log]) if acc_log else 0
+                max_seq = max(max_seq, peer_max)
+            if comm_log:
+                peer_max_comm = max(comm_log.keys()) if comm_log else 0
+                max_seq = max(max_seq, peer_max_comm)
         
         # Fill gaps with no-op
         new_log = set()
@@ -247,6 +259,8 @@ class Node(process):
                 best = max(entries_at_s)  # Highest ballot
                 new_log.add((self.ballot_num, s, best[2]))
             else:
+                # CRITICAL: Fill empty slots with No-Op to maintain log continuity
+                output(f"Leader {self.node_name} filling seq={s} with NO-OP")
                 new_log.add((self.ballot_num, s, 'NO-OP'))
         
         self.accept_log = new_log
