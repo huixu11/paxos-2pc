@@ -8,6 +8,8 @@ TIMEOUT = 5.0
 HEARTBEAT_INTERVAL = 0.5
 HEARTBEAT_TIMEOUT = 3.0
 
+
+
 # Helper Functions
 def parse_transaction(tx_str):
     """Parse transaction string like '(A, B, 10)' or '(A)'"""
@@ -174,31 +176,51 @@ class Node(process):
         if self.is_failed:
             return
         
+        # output(f"{self.node_name} received PREPARE {b} from {p}")
+        
         if b > self.ballot_num:
+            output(f"{self.node_name} voting for {p} (ballot {b})")
             self.ballot_num = b
             self.status = 'FOLLOWER'
             self.leader = p
-            send(('ACK', b, self.accept_log), to=p)
+            # 发送accept_log和committed_log，让新leader能学习已committed state
+            send(('ACK', b, self.accept_log, self.committed_log, self.last_executed_seq), to=p)
     
-    def receive(msg=('ACK', b, acc_log), from_=p):
+    def receive(msg=('ACK', b, acc_log, comm_log, last_exec), from_=p):
         if self.is_failed or self.status != 'CANDIDATE' or b != self.ballot_num:
             return
         
-        self.promises[b][p] = acc_log
+        # output(f"{self.node_name} received ACK from {p}")
+        
+        # Store all three: accept_log, committed_log, last_executed_seq
+        self.promises[b][p] = (acc_log, comm_log, last_exec)
         
         # Check for majority
         if len(self.promises[b]) >= len(self.peers) / 2:
+            output(f"{self.node_name} got majority! Becoming leader.")
             become_leader()
     
     def become_leader():
         self.status = 'LEADER'
         self.leader = self
         
-        # Construct NEW-VIEW
+        # Construct NEW-VIEW from both accept_log AND committed_log
         all_entries = set()
-        for log in self.promises[self.ballot_num].values():
-            all_entries.update(log)
+        max_last_exec = self.last_executed_seq
+        
+        for (acc_log, comm_log, last_exec) in self.promises[self.ballot_num].values():
+            # Include accepted entries
+            all_entries.update(acc_log)
+            # Include committed entries (这些是权威的！)
+            for seq, val in comm_log.items():
+                all_entries.add((self.ballot_num, seq, val))
+            # Track最高last_executed_seq
+            max_last_exec = max(max_last_exec, last_exec)
+        
+        # Add our own logs
         all_entries.update(self.accept_log)
+        for seq, val in self.committed_log.items():
+            all_entries.add((self.ballot_num, seq, val))
         
         # Find max sequence number
         max_seq = max([e[1] for e in all_entries]) if all_entries else 0
@@ -229,6 +251,16 @@ class Node(process):
         nv_msg = ('NEW-VIEW', self.ballot_num, new_log)
         self.new_view_messages.append(nv_msg)
         send(nv_msg, to=self.peers)
+        
+        # CATCH-UP MECHANISM: Send COMMIT for all already-committed entries
+        # This allows recovered nodes to execute missed transactions
+        for seq in range(1, max_last_exec + 1):
+            # Find the entry for this sequence in new_log
+            entry = [e for e in new_log if e[1] == seq]
+            if entry:
+                _, _, val = entry[0]
+                send(('COMMIT', self.ballot_num, seq, val), to=self.peers)
+                output(f"Leader {self.node_name} sending catch-up COMMIT for seq={seq}")
     
     def receive(msg=('NEW-VIEW', b, new_log), from_=leader):
         if self.is_failed:
@@ -263,9 +295,10 @@ class Node(process):
     
     def receive(msg=('CLIENT_REQUEST', tx, timestamp, cid, req_id), from_=client):
         if self.is_failed:
+            output(f"{self.node_name} ignoring REQUEST {req_id} because is_failed=True")
             return
         
-        output(f"{self.node_name} received REQUEST {req_id} from client")
+        output(f"{self.node_name} received REQUEST {req_id} from client (is_failed={self.is_failed})")
         
         # Check if already processed
         if (cid, req_id) in self.client_replies:
@@ -402,6 +435,7 @@ class Node(process):
     
     def receive(msg=('FAIL',)):
         self.is_failed = True
+        output(f"{self.node_name} FAILED (is_failed=True)")
         
     def receive(msg=('FAIL_LEADER',)):
         if self.status == 'LEADER':
@@ -409,10 +443,41 @@ class Node(process):
             output(f"{self.node_name} (LEADER) FAILED by LF command")
     
     def receive(msg=('RECOVER',)):
+        output(f"{self.node_name} RECOVERING (last_executed={self.last_executed_seq}, db_size={len(self.db)})")
         self.is_failed = False
-        # Do not start election immediately - wait for heartbeat timeout
-        # if self.status != 'LEADER':
-        #     start_election()
+        
+        # ACTIVE CATCH-UP: Request missing transactions from peers
+        send(('CATCHUP_REQUEST', self.last_executed_seq, self), to=self.peers)
+    
+    def receive(msg=('CATCHUP_REQUEST', peer_last_exec, peer_proc), from_=p):
+        if self.is_failed:
+            return
+            
+        # Find transactions that the peer is missing
+        missing_txs = {}
+        for seq, val in self.committed_log.items():
+            if seq > peer_last_exec:
+                missing_txs[seq] = val
+        
+        if missing_txs:
+            output(f"{self.node_name} sending {len(missing_txs)} missing txs to {p}")
+            send(('CATCHUP_RESPONSE', missing_txs), to=peer_proc)
+
+    def receive(msg=('CATCHUP_RESPONSE', missing_txs), from_=p):
+        if self.is_failed:
+            return
+            
+        output(f"{self.node_name} received catch-up data from {p}: {len(missing_txs)} txs")
+        
+        # Update committed log with missing transactions
+        updated = False
+        for seq, val in missing_txs.items():
+            if seq not in self.committed_log:
+                self.committed_log[seq] = val
+                updated = True
+        
+        if updated:
+            execute_committed()
     
     def receive(msg=('RESET',)):
         output(f"{self.node_name} RESET. Peers: {len(self.peers)}")
@@ -438,6 +503,8 @@ class Node(process):
         output(f'{self.node_name}: {balance}')
     
     def receive(msg=('PRINT_DB',)):
+        if self.is_failed:
+            return
         # Print all known clients
         sorted_clients = sorted(list(self.known_clients))
         items = []
