@@ -123,6 +123,9 @@ class Node(process):
         # For PrintView
         self.new_view_messages = []
         
+        # Request buffering during election
+        self.pending_client_requests = []  # Buffer for requests during leader election
+        
         # Heartbeat
         self.last_heartbeat = time.time()
     
@@ -153,6 +156,8 @@ class Node(process):
                     pass
                 elif timeout(to_wait):
                     output(f"Follower {self.node_name} timed out! Starting election.")
+                    # Clear leader reference (leader is considered failed)
+                    self.leader = None
                     # Start election
                     start_election()
             
@@ -203,6 +208,15 @@ class Node(process):
     def become_leader():
         self.status = 'LEADER'
         self.leader = self
+        
+        # Process buffered client requests
+        if self.pending_client_requests:
+            output(f"Leader {self.node_name} processing {len(self.pending_client_requests)} buffered requests")
+            buffered = self.pending_client_requests[:]
+            self.pending_client_requests = []
+            for req_msg in buffered:
+                # Re-send to self to process as leader
+                send(req_msg, to=self)
         
         # Construct NEW-VIEW from both accept_log AND committed_log
         all_entries = set()
@@ -277,6 +291,13 @@ class Node(process):
             # Send ACCEPTED for all entries
             for (ballot, seq, val) in new_log:
                 send(('ACCEPTED', ballot, seq, val, self), to=leader)
+            
+            # Forward any buffered client requests to new leader
+            if self.pending_client_requests:
+                output(f"{self.node_name} forwarding {len(self.pending_client_requests)} buffered requests to new leader")
+                for req_msg in self.pending_client_requests:
+                    send(req_msg, to=leader)
+                self.pending_client_requests = []
     
     # === Heartbeat ===
     
@@ -310,6 +331,10 @@ class Node(process):
         if self.status != 'LEADER':
             if self.leader:
                 send(('CLIENT_REQUEST', tx, timestamp, cid, req_id), to=self.leader)
+            else:
+                # Buffer request during election (no known leader)
+                output(f"{self.node_name} buffering REQUEST {req_id} (no leader)")
+                self.pending_client_requests.append(('CLIENT_REQUEST', tx, timestamp, cid, req_id, client))
             return
         
         # Check if already being processed (pending)
@@ -580,6 +605,9 @@ def main():
                 elif tx_str.strip().startswith('R('):
                     node_name = tx_str.strip()[2:-1]
                     current_set['transactions'].append(('RECOVER', node_name))
+                elif tx_str.strip() == 'LF':
+                    # Leader Fail command
+                    current_set['transactions'].append(('LF', None))
                 else:
                     tx = parse_transaction(tx_str)
                     if tx:
@@ -610,22 +638,21 @@ def main():
                     send(('FAIL',), to=node_map[name])
         
         # Process transactions
-        for tx_type, tx_data in test_set['transactions']:
+        output(f"Set {test_set['id']}: Processing {len(test_set['transactions'])} transactions")
+        for i, (tx_type, tx_data) in enumerate(test_set['transactions']):
+            output(f"  Transaction {i}: type={tx_type}, data={tx_data}")
             if tx_type == 'FAIL':
                 send(('FAIL',), to=node_map[tx_data])
             elif tx_type == 'RECOVER':
                 send(('RECOVER',), to=node_map[tx_data])
+            elif tx_type == 'LF':
+                # Leader Fail - fail n1 (node at index 0)
+                output("Executing LF (Leader Fail)")
+                send(('FAIL',), to=nodes_list[0])
+                time.sleep(1.0)  # Wait for failure to take effect
             elif tx_type == 'TX':
-                if tx_data == ('LF',):
-                    output("Executing LF (Leader Fail)")
-                    # Fail n1 explicitly (node at index 0)
-                    send(('FAIL',), to=nodes_list[0])
-                    time.sleep(1.0) # Wait for failure to take effect
-                    continue
-                
                 send(('TRIGGER_TX', tx_data), to=client)
                 
-                # Wait for result
                 # Wait for result
                 if await(some(received(('TX_RESULT', tx_val, _)), has= tx_val == tx_data)):
                     results = setof((t, r), received(('TX_RESULT', t, r)), t == tx_data)
