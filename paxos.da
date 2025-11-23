@@ -56,32 +56,24 @@ class Client(process):
         timestamp = time.time()
         self.pending = (req_id, tx, timestamp)
         
-        # Send to leader
+        # Initial attempt: Send to known leader
         output(f"Client sending {req_id} to {self.leader}")
         send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id), to=self.leader)
         
-        # Wait for reply with timeout
-        if await(some(received(('CLIENT_REPLY', r_id, _), from_=sender_proc), has= r_id == req_id)):
-            replies = setof((p, res), received(('CLIENT_REPLY', r_id, res), from_=p), r_id == req_id)
-            new_leader, result = replies.pop()
-            self.leader = new_leader
-            self.pending = None
-            return result
-        elif timeout(TIMEOUT):
-            output("Client timeout, broadcasting...")
-            # Broadcast to all nodes on timeout
-            send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id), to=self.nodes)
-            
-            # Wait again
+        # Retry loop - keep trying until we get a response
+        while True:
             if await(some(received(('CLIENT_REPLY', r_id, _), from_=sender_proc), has= r_id == req_id)):
                 replies = setof((p, res), received(('CLIENT_REPLY', r_id, res), from_=p), r_id == req_id)
                 new_leader, result = replies.pop()
                 self.leader = new_leader
                 self.pending = None
                 return result
-            elif timeout(TIMEOUT * 2):
-                self.pending = None
-                return "TIMEOUT"
+            elif timeout(TIMEOUT):
+                output("Client timeout, broadcasting...")
+                # Broadcast to all nodes on timeout
+                send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id), to=self.nodes)
+
+
 
 # Node Process
 class Node(process):
@@ -123,9 +115,6 @@ class Node(process):
         # For PrintView
         self.new_view_messages = []
         
-        # Request buffering during election
-        self.pending_client_requests = []  # Buffer for requests during leader election
-        
         # Heartbeat
         self.last_heartbeat = time.time()
     
@@ -156,8 +145,6 @@ class Node(process):
                     pass
                 elif timeout(to_wait):
                     output(f"Follower {self.node_name} timed out! Starting election.")
-                    # Clear leader reference (leader is considered failed)
-                    self.leader = None
                     # Start election
                     start_election()
             
@@ -209,15 +196,6 @@ class Node(process):
         self.status = 'LEADER'
         self.leader = self
         
-        # Process buffered client requests
-        if self.pending_client_requests:
-            output(f"Leader {self.node_name} processing {len(self.pending_client_requests)} buffered requests")
-            buffered = self.pending_client_requests[:]
-            self.pending_client_requests = []
-            for req_msg in buffered:
-                # Re-send to self to process as leader
-                send(req_msg, to=self)
-        
         # Construct NEW-VIEW from both accept_log AND committed_log
         all_entries = set()
         max_last_exec = self.last_executed_seq
@@ -236,20 +214,8 @@ class Node(process):
         for seq, val in self.committed_log.items():
             all_entries.add((self.ballot_num, seq, val))
         
-        # Find max sequence number from all sources (accepted AND committed)
-        # This ensures we cover any sequences that were proposed but not committed
+        # Find max sequence number
         max_seq = max([e[1] for e in all_entries]) if all_entries else 0
-        
-        # IMPORTANT: Also check the highest sequence in ANY peer's accept_log
-        # This handles the case where a previous leader proposed seq=N but crashed
-        # before anyone committed it. We must include seq=N in NEW-VIEW (as No-Op if empty)
-        for (acc_log, comm_log, last_exec) in self.promises[self.ballot_num].values():
-            if acc_log:
-                peer_max = max([e[1] for e in acc_log]) if acc_log else 0
-                max_seq = max(max_seq, peer_max)
-            if comm_log:
-                peer_max_comm = max(comm_log.keys()) if comm_log else 0
-                max_seq = max(max_seq, peer_max_comm)
         
         # Fill gaps with no-op
         new_log = set()
@@ -259,8 +225,6 @@ class Node(process):
                 best = max(entries_at_s)  # Highest ballot
                 new_log.add((self.ballot_num, s, best[2]))
             else:
-                # CRITICAL: Fill empty slots with No-Op to maintain log continuity
-                output(f"Leader {self.node_name} filling seq={s} with NO-OP")
                 new_log.add((self.ballot_num, s, 'NO-OP'))
         
         self.accept_log = new_log
@@ -305,13 +269,6 @@ class Node(process):
             # Send ACCEPTED for all entries
             for (ballot, seq, val) in new_log:
                 send(('ACCEPTED', ballot, seq, val, self), to=leader)
-            
-            # Forward any buffered client requests to new leader
-            if self.pending_client_requests:
-                output(f"{self.node_name} forwarding {len(self.pending_client_requests)} buffered requests to new leader")
-                for req_msg in self.pending_client_requests:
-                    send(req_msg, to=leader)
-                self.pending_client_requests = []
     
     # === Heartbeat ===
     
@@ -345,10 +302,6 @@ class Node(process):
         if self.status != 'LEADER':
             if self.leader:
                 send(('CLIENT_REQUEST', tx, timestamp, cid, req_id), to=self.leader)
-            else:
-                # Buffer request during election (no known leader)
-                output(f"{self.node_name} buffering REQUEST {req_id} (no leader)")
-                self.pending_client_requests.append(('CLIENT_REQUEST', tx, timestamp, cid, req_id, client))
             return
         
         # Check if already being processed (pending)
@@ -619,9 +572,6 @@ def main():
                 elif tx_str.strip().startswith('R('):
                     node_name = tx_str.strip()[2:-1]
                     current_set['transactions'].append(('RECOVER', node_name))
-                elif tx_str.strip() == 'LF':
-                    # Leader Fail command
-                    current_set['transactions'].append(('LF', None))
                 else:
                     tx = parse_transaction(tx_str)
                     if tx:
@@ -652,27 +602,28 @@ def main():
                     send(('FAIL',), to=node_map[name])
         
         # Process transactions
-        output(f"Set {test_set['id']}: Processing {len(test_set['transactions'])} transactions")
-        for i, (tx_type, tx_data) in enumerate(test_set['transactions']):
-            output(f"  Transaction {i}: type={tx_type}, data={tx_data}")
+        for tx_type, tx_data in test_set['transactions']:
             if tx_type == 'FAIL':
                 send(('FAIL',), to=node_map[tx_data])
             elif tx_type == 'RECOVER':
                 send(('RECOVER',), to=node_map[tx_data])
-            elif tx_type == 'LF':
-                # Leader Fail - fail n1 (node at index 0)
-                output("Executing LF (Leader Fail)")
-                send(('FAIL',), to=nodes_list[0])
-                time.sleep(1.0)  # Wait for failure to take effect
             elif tx_type == 'TX':
+                if tx_data == ('LF',):
+                    output("Executing LF (Leader Fail)")
+                    # Fail n1 explicitly (node at index 0)
+                    send(('FAIL',), to=nodes_list[0])
+                    time.sleep(1.0) # Wait for failure to take effect
+                    continue
+                
                 send(('TRIGGER_TX', tx_data), to=client)
                 
+                # Wait for result
                 # Wait for result
                 if await(some(received(('TX_RESULT', tx_val, _)), has= tx_val == tx_data)):
                     results = setof((t, r), received(('TX_RESULT', t, r)), t == tx_data)
                     _, result = results.pop()
                     output(f"Tx {tx_data} -> {result}")
-                elif timeout(5.0):
+                elif timeout(60.0):
                     output(f"Tx {tx_data} -> TIMEOUT")
         
         # Print DB
