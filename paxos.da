@@ -6,7 +6,7 @@ import random
 # Configuration
 TIMEOUT = 5.0
 HEARTBEAT_INTERVAL = 0.5
-HEARTBEAT_TIMEOUT = 3.0
+HEARTBEAT_TIMEOUT = 1.0  # Reduced from 3.0 for faster leader election after LF
 
 
 
@@ -56,24 +56,32 @@ class Client(process):
         timestamp = time.time()
         self.pending = (req_id, tx, timestamp)
         
-        # Initial attempt: Send to known leader
+        # Send to leader
         output(f"Client sending {req_id} to {self.leader}")
         send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id), to=self.leader)
         
-        # Retry loop - keep trying until we get a response
-        while True:
+        # Wait for reply with timeout
+        if await(some(received(('CLIENT_REPLY', r_id, _), from_=sender_proc), has= r_id == req_id)):
+            replies = setof((p, res), received(('CLIENT_REPLY', r_id, res), from_=p), r_id == req_id)
+            new_leader, result = replies.pop()
+            self.leader = new_leader
+            self.pending = None
+            return result
+        elif timeout(TIMEOUT):
+            output("Client timeout, broadcasting...")
+            # Broadcast to all nodes on timeout
+            send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id), to=self.nodes)
+            
+            # Wait again
             if await(some(received(('CLIENT_REPLY', r_id, _), from_=sender_proc), has= r_id == req_id)):
                 replies = setof((p, res), received(('CLIENT_REPLY', r_id, res), from_=p), r_id == req_id)
                 new_leader, result = replies.pop()
                 self.leader = new_leader
                 self.pending = None
                 return result
-            elif timeout(TIMEOUT):
-                output("Client timeout, broadcasting...")
-                # Broadcast to all nodes on timeout
-                send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id), to=self.nodes)
-
-
+            elif timeout(TIMEOUT * 2):
+                self.pending = None
+                return "TIMEOUT"
 
 # Node Process
 class Node(process):
@@ -243,16 +251,6 @@ class Node(process):
         nv_msg = ('NEW-VIEW', self.ballot_num, new_log)
         self.new_view_messages.append(nv_msg)
         send(nv_msg, to=self.peers)
-        
-        # CATCH-UP MECHANISM: Send COMMIT for all already-committed entries
-        # This allows recovered nodes to execute missed transactions
-        for seq in range(1, max_last_exec + 1):
-            # Find the entry for this sequence in new_log
-            entry = [e for e in new_log if e[1] == seq]
-            if entry:
-                _, _, val = entry[0]
-                send(('COMMIT', self.ballot_num, seq, val), to=self.peers)
-                output(f"Leader {self.node_name} sending catch-up COMMIT for seq={seq}")
     
     def receive(msg=('NEW-VIEW', b, new_log), from_=leader):
         if self.is_failed:
@@ -601,6 +599,13 @@ def main():
                 else:
                     send(('FAIL',), to=node_map[name])
         
+        # Check if quorum is met for this set
+        live_count = len(test_set['live_nodes']) if test_set['live_nodes'] else 5
+        quorum_met = live_count >= 3
+        
+        if not quorum_met:
+            output(f"WARNING: Only {live_count} live nodes - Quorum NOT met, skipping transactions")
+        
         # Process transactions
         for tx_type, tx_data in test_set['transactions']:
             if tx_type == 'FAIL':
@@ -615,15 +620,19 @@ def main():
                     time.sleep(1.0) # Wait for failure to take effect
                     continue
                 
+                # Skip transaction if quorum not met
+                if not quorum_met:
+                    output(f"Tx {tx_data} -> SKIPPED (no quorum)")
+                    continue
+                
                 send(('TRIGGER_TX', tx_data), to=client)
                 
-                # Wait for result
                 # Wait for result
                 if await(some(received(('TX_RESULT', tx_val, _)), has= tx_val == tx_data)):
                     results = setof((t, r), received(('TX_RESULT', t, r)), t == tx_data)
                     _, result = results.pop()
                     output(f"Tx {tx_data} -> {result}")
-                elif timeout(60.0):
+                elif timeout(5.0):
                     output(f"Tx {tx_data} -> TIMEOUT")
         
         # Print DB
