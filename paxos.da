@@ -95,6 +95,7 @@ class Node(process):
         self.ballot_num = (1, self) if is_initial_leader else (0, self)
         self.status = 'LEADER' if is_initial_leader else 'FOLLOWER'
         self.leader = self if is_initial_leader else None
+        self.current_leader = self if is_initial_leader else None  # Track current leader
         
         # Logs
         self.accept_log = set()  # Set of (ballot, seq, val)
@@ -134,7 +135,7 @@ class Node(process):
             
             # Leader sends heartbeats
             if self.status == 'LEADER':
-                send(('HEARTBEAT', self.ballot_num), to=self.peers)
+                send(('HEARTBEAT', self.ballot_num, self), to=self.peers)
                 
                 if await(some(received(_))):
                     pass
@@ -203,17 +204,23 @@ class Node(process):
     def become_leader():
         self.status = 'LEADER'
         self.leader = self
+        self.current_leader = self  # Track current leader
         
         # Construct NEW-VIEW from both accept_log AND committed_log
         all_entries = set()
         max_last_exec = self.last_executed_seq
+        max_seen_seq = 0  # Track max seq seen by majority
         
         for (acc_log, comm_log, last_exec) in self.promises[self.ballot_num].values():
             # Include accepted entries
             all_entries.update(acc_log)
+            # Track max seq from this node
+            if acc_log:
+                max_seen_seq = max(max_seen_seq, max([e[1] for e in acc_log]))
             # Include committed entries (这些是权威的！)
             for seq, val in comm_log.items():
                 all_entries.add((self.ballot_num, seq, val))
+                max_seen_seq = max(max_seen_seq, seq)
             # Track最高last_executed_seq
             max_last_exec = max(max_last_exec, last_exec)
         
@@ -222,8 +229,10 @@ class Node(process):
         for seq, val in self.committed_log.items():
             all_entries.add((self.ballot_num, seq, val))
         
-        # Find max sequence number
-        max_seq = max([e[1] for e in all_entries]) if all_entries else 0
+        # Use majority-seen max_seq with soft cap for safety
+        max_seq = max(max_seen_seq, max([e[1] for e in all_entries])) if all_entries else 0
+        SOFT_CAP = 200
+        max_seq = min(max_seq, self.last_executed_seq + SOFT_CAP)
         
         # Fill gaps with no-op
         new_log = set()
@@ -270,17 +279,16 @@ class Node(process):
     
     # === Heartbeat ===
     
-    def receive(msg=('HEARTBEAT', b), from_=leader):
+    def receive(msg=('HEARTBEAT', b, leader_proc), from_=p):
         if self.is_failed:
             return
         
         if b >= self.ballot_num:
-            self.ballot_num = b
-            self.status = 'FOLLOWER'
-            self.leader = leader
-            self.last_heartbeat = time.time()
-            # output(f"{self.node_name} received HEARTBEAT from {leader}")
-    
+            self.ballot_num = b
+            self.leader = leader_proc
+            self.current_leader = leader_proc  # Track current leader
+            self.last_heartbeat = time.time()
+            self.status = 'FOLLOWER'
     # === Normal Operations ===
     
     def receive(msg=('CLIENT_REQUEST', tx, timestamp, cid, req_id), from_=client):
@@ -432,6 +440,12 @@ class Node(process):
             self.is_failed = True
             output(f"{self.node_name} (LEADER) FAILED by LF command")
     
+    def receive(msg=('LEADER_FAILED', failed_leader)):
+        # Immediate view change when leader failed
+        if not self.is_failed and failed_leader == self.current_leader and self.status != 'LEADER':
+            output(f"{self.node_name} detected leader {failed_leader} failed! Triggering immediate election.")
+            start_election()
+    
     def receive(msg=('RECOVER',)):
         output(f"{self.node_name} RECOVERING (last_executed={self.last_executed_seq}, db_size={len(self.db)})")
         self.is_failed = False
@@ -616,8 +630,11 @@ def main():
                 if tx_data == ('LF',):
                     output("Executing LF (Leader Fail)")
                     # Fail n1 explicitly (node at index 0)
-                    send(('FAIL',), to=nodes_list[0])
-                    time.sleep(1.0) # Wait for failure to take effect
+                    failed_leader = nodes_list[0]
+                    send(('FAIL',), to=failed_leader)
+                    # Broadcast immediate leader failure notification
+                    send(('LEADER_FAILED', failed_leader), to=nodes)
+                    time.sleep(0.5) # Reduced for faster recovery
                     continue
                 
                 # Skip transaction if quorum not met
