@@ -7,6 +7,9 @@ import random
 TIMEOUT = 5.0
 HEARTBEAT_INTERVAL = 0.5
 HEARTBEAT_TIMEOUT = 1.0  # Reduced from 3.0 for faster leader election after LF
+ELECTION_TIMEOUT = 1.5  # t: follower timer reset by leader traffic
+PREPARE_BACKOFF = 0.6   # tp: suppress competing prepares seen very recently
+ELECTION_JITTER = 0.3   # small jitter to avoid simultaneous elections
 
 
 
@@ -95,7 +98,8 @@ class Node(process):
         self.ballot_num = (1, self) if is_initial_leader else (0, self)
         self.status = 'LEADER' if is_initial_leader else 'FOLLOWER'
         self.leader = self if is_initial_leader else None
-        self.current_leader = self if is_initial_leader else None  # Track current leader
+        self.current_leader = self if is_initial_leader else None  # Track current leader
+
         
         # Logs
         self.accept_log = set()  # Set of (ballot, seq, val)
@@ -120,12 +124,14 @@ class Node(process):
         
         # Failure state
         self.is_failed = False
+
+        # Election timers/backoff
+        self.last_leader_msg = time.time()
+        self.buffered_prepare = None  # Highest PREPARE seen while timer active
+        self.last_prepare_received_time = 0.0
         
         # For PrintView
         self.new_view_messages = []
-        
-        # Heartbeat
-        self.last_heartbeat = time.time()
     
     def run():
         while True:
@@ -144,32 +150,61 @@ class Node(process):
             
             # Follower checks for heartbeat timeout
             elif self.status == 'FOLLOWER':
-                old_hb = self.last_heartbeat
-                # Add random jitter to prevent livelock (dueling leaders)
-                jitter = random.uniform(0, 2.0)
-                to_wait = (HEARTBEAT_TIMEOUT + jitter) - (time.time() - old_hb)
-                if to_wait < 0: to_wait = 0
+                old_timer = self.last_leader_msg
+                jitter = random.uniform(0, ELECTION_JITTER)
+                to_wait = (ELECTION_TIMEOUT + jitter) - (time.time() - old_timer)
+                if to_wait < 0:
+                    to_wait = 0
                 
-                if await(self.last_heartbeat > old_hb):
+                if await(self.last_leader_msg > old_timer):
                     pass
                 elif timeout(to_wait):
-                    output(f"Follower {self.node_name} timed out! Starting election.")
-                    # Start election
-                    start_election()
+                    output(f"Follower {self.node_name} timer expired; checking leader election.")
+                    handle_timer_expiry()
             
             else:  # CANDIDATE
                 await(some(received(_)))
     
     # === Leader Election ===
     
+    def timer_has_expired():
+        return (time.time() - self.last_leader_msg) >= ELECTION_TIMEOUT
+    
+    def handle_timer_expiry():
+        if self.is_failed:
+            return
+        
+        # Honor any buffered PREPARE with the highest ballot seen so far
+        if self.buffered_prepare:
+            b, proposer = self.buffered_prepare
+            self.buffered_prepare = None
+            if b > self.ballot_num:
+                accept_prepare(b, proposer)
+                return
+        
+        now = time.time()
+        # Avoid dueling leaders if we've recently seen another PREPARE
+        if (now - self.last_prepare_received_time) < PREPARE_BACKOFF:
+            output(f"{self.node_name} deferring election due to recent PREPARE traffic")
+            self.status = 'FOLLOWER'
+            return
+        
+        start_election()
+    
     def start_election():
         output(f"{self.node_name} starting election")
         if self.is_failed:
             return
         
+        now = time.time()
+        if (now - self.last_prepare_received_time) < PREPARE_BACKOFF:
+            output(f"{self.node_name} skipping PREPARE broadcast (backoff window)")
+            self.status = 'FOLLOWER'
+            return
+        
         self.status = 'CANDIDATE'
         self.ballot_num = (self.ballot_num[0] + 1, self)
-        self.promises[self.ballot_num] = {}
+        self.promises[self.ballot_num] = {self: set(self.accept_log)}
         
         send(('PREPARE', self.ballot_num), to=self.peers)
     
@@ -177,72 +212,62 @@ class Node(process):
         if self.is_failed:
             return
         
-        # output(f"{self.node_name} received PREPARE {b} from {p}")
+        self.last_prepare_received_time = time.time()
         
-        if b > self.ballot_num:
-            output(f"{self.node_name} voting for {p} (ballot {b})")
-            self.ballot_num = b
-            self.status = 'FOLLOWER'
-            self.leader = p
-            # 发送accept_log和committed_log，让新leader能学习已committed state
-            send(('ACK', b, self.accept_log, self.committed_log, self.last_executed_seq), to=p)
+        if timer_has_expired() and b > self.ballot_num:
+            output(f"{self.node_name} voting for {p} (ballot {b}) after timer expiry")
+            accept_prepare(b, p)
+        else:
+            # Buffer the highest PREPARE seen while the timer is still active
+            if self.buffered_prepare is None or b > self.buffered_prepare[0]:
+                self.buffered_prepare = (b, p)
     
-    def receive(msg=('ACK', b, acc_log, comm_log, last_exec), from_=p):
+    def accept_prepare(b, proposer):
+        self.ballot_num = b
+        self.status = 'FOLLOWER'
+        self.leader = proposer
+        self.current_leader = proposer
+        self.buffered_prepare = None
+        self.last_leader_msg = time.time()
+        send(('ACK', b, set(self.accept_log)), to=proposer)
+    
+    def receive(msg=('ACK', b, acc_log), from_=p):
         if self.is_failed or self.status != 'CANDIDATE' or b != self.ballot_num:
             return
         
         # output(f"{self.node_name} received ACK from {p}")
         
-        # Store all three: accept_log, committed_log, last_executed_seq
-        self.promises[b][p] = (acc_log, comm_log, last_exec)
+        self.promises[b][p] = set(acc_log)
         
         # Check for majority
-        if len(self.promises[b]) >= len(self.peers) / 2:
-            output(f"{self.node_name} got majority! Becoming leader.")
+        majority = (self.cluster_size // 2) + 1
+        if len(self.promises[b]) >= majority:
+            output(f"{self.node_name} got majority promises! Becoming leader.")
             become_leader()
     
     def become_leader():
         self.status = 'LEADER'
         self.leader = self
-        self.current_leader = self  # Track current leader
+        self.current_leader = self  # Track current leader
         
-        # Construct NEW-VIEW from both accept_log AND committed_log
+        # Construct NEW-VIEW from quorum AcceptLogs
         all_entries = set()
-        max_last_exec = self.last_executed_seq
-        max_seen_seq = 0  # Track max seq seen by majority
-        
-        for (acc_log, comm_log, last_exec) in self.promises[self.ballot_num].values():
-            # Include accepted entries
+        for acc_log in self.promises[self.ballot_num].values():
             all_entries.update(acc_log)
-            # Track max seq from this node
-            if acc_log:
-                max_seen_seq = max(max_seen_seq, max([e[1] for e in acc_log]))
-            # Include committed entries (这些是权威的！)
-            for seq, val in comm_log.items():
-                all_entries.add((self.ballot_num, seq, val))
-                max_seen_seq = max(max_seen_seq, seq)
-            # Track最高last_executed_seq
-            max_last_exec = max(max_last_exec, last_exec)
-        
-        # Add our own logs
         all_entries.update(self.accept_log)
-        for seq, val in self.committed_log.items():
-            all_entries.add((self.ballot_num, seq, val))
         
-        # Use majority-seen max_seq with soft cap for safety
-        max_seq = max(max_seen_seq, max([e[1] for e in all_entries])) if all_entries else 0
-        SOFT_CAP = 200
-        max_seq = min(max_seq, self.last_executed_seq + SOFT_CAP)
+        max_seq = max([e[1] for e in all_entries]) if all_entries else 0
         
-        # Fill gaps with no-op
+        # Fill gaps with no-op and choose highest-ballot entry per seq
         new_log = set()
         for s in range(1, max_seq + 1):
             entries_at_s = [e for e in all_entries if e[1] == s]
             if entries_at_s:
-                best = max(entries_at_s)  # Highest ballot
-                new_log.add((self.ballot_num, s, best[2]))
+                best = max(entries_at_s)  # Highest ballot wins
+                chosen_val = best[2]
             else:
-                new_log.add((self.ballot_num, s, 'NO-OP'))
+                chosen_val = 'NO-OP'
+            new_log.add((self.ballot_num, s, chosen_val))
         
         self.accept_log = new_log
         self.next_seq = max_seq + 1
@@ -257,7 +282,8 @@ class Node(process):
         output(f"Leader {self.node_name} NEW-VIEW: {len(new_log)} entries, seq range 1-{max_seq}")
         
         # Send NEW-VIEW
-        nv_msg = ('NEW-VIEW', self.ballot_num, new_log)
+        ordered_new_log = sorted(new_log, key=lambda e: e[1])
+        nv_msg = ('NEW-VIEW', self.ballot_num, ordered_new_log)
         self.new_view_messages.append(nv_msg)
         send(nv_msg, to=self.peers)
     
@@ -270,25 +296,35 @@ class Node(process):
             self.ballot_num = b
             self.status = 'FOLLOWER'
             self.leader = leader
-            self.accept_log = new_log
+            self.current_leader = leader
+            self.accept_log = set(new_log)
+            self.last_leader_msg = time.time()
+            self.buffered_prepare = None
             self.new_view_messages.append(('NEW-VIEW', b, new_log))
             
-            # Send ACCEPTED for all entries
+            # Per project spec: treat as Accept messages, send ACCEPTED
+            # Do NOT commit/execute here - wait for COMMIT messages from leader
             for (ballot, seq, val) in new_log:
                 send(('ACCEPTED', ballot, seq, val, self), to=leader)
     
     # === Heartbeat ===
     
-    def receive(msg=('HEARTBEAT', b, leader_proc), from_=p):
+    def receive(msg=('HEARTBEAT', b, leader_proc), from_=p):
+
         if self.is_failed:
             return
         
         if b >= self.ballot_num:
-            self.ballot_num = b
-            self.leader = leader_proc
-            self.current_leader = leader_proc  # Track current leader
-            self.last_heartbeat = time.time()
-            self.status = 'FOLLOWER'
+            self.ballot_num = b
+
+            self.leader = leader_proc
+
+            self.current_leader = leader_proc  # Track current leader
+
+            self.last_leader_msg = time.time()
+
+            self.status = 'FOLLOWER'
+
     # === Normal Operations ===
     
     def receive(msg=('CLIENT_REQUEST', tx, timestamp, cid, req_id), from_=client):
@@ -338,6 +374,8 @@ class Node(process):
         if b >= self.ballot_num:
             self.ballot_num = b
             self.leader = leader
+            self.current_leader = leader
+            self.last_leader_msg = time.time()
             self.accept_log.add((b, seq, val))
             send(('ACCEPTED', b, seq, val, self), to=leader)
             output(f"{self.node_name} accepted {seq} from {leader}")
@@ -364,6 +402,9 @@ class Node(process):
         if self.is_failed:
             return
         
+        if b > self.ballot_num:
+            self.ballot_num = b
+        self.last_leader_msg = time.time()
         handle_commit(b, seq, val)
     
     def handle_commit(b, seq, val):
@@ -440,48 +481,45 @@ class Node(process):
             self.is_failed = True
             output(f"{self.node_name} (LEADER) FAILED by LF command")
     
-    def receive(msg=('LEADER_FAILED', failed_leader)):
-        # Immediate view change when leader failed
-        if not self.is_failed and failed_leader == self.current_leader and self.status != 'LEADER':
-            output(f"{self.node_name} detected leader {failed_leader} failed! Triggering immediate election.")
-            start_election()
-    
+    def receive(msg=('LEADER_FAILED', failed_leader)):
+
+        # Immediate view change when leader failed
+
+        if not self.is_failed and failed_leader == self.current_leader and self.status != 'LEADER':
+
+            output(f"{self.node_name} detected leader {failed_leader} failed! Triggering immediate election.")
+
+            start_election()
+
+    
+
     def receive(msg=('RECOVER',)):
         output(f"{self.node_name} RECOVERING (last_executed={self.last_executed_seq}, db_size={len(self.db)})")
         self.is_failed = False
-        
-        # ACTIVE CATCH-UP: Request missing transactions from peers
+        self.last_leader_msg = time.time()
+        self.buffered_prepare = None
+        # Actively request missing commits since leader may not change
         send(('CATCHUP_REQUEST', self.last_executed_seq, self), to=self.peers)
+        
+        # No need for active catch-up - NEW-VIEW will synchronize state
+        # send(('CATCHUP_REQUEST', self.last_executed_seq, self), to=self.peers)
     
-    def receive(msg=('CATCHUP_REQUEST', peer_last_exec, peer_proc), from_=p):
+    def receive(msg=('CATCHUP_REQUEST', last_exec, requester), from_=p):
         if self.is_failed:
             return
-            
-        # Find transactions that the peer is missing
-        missing_txs = {}
-        for seq, val in self.committed_log.items():
-            if seq > peer_last_exec:
-                missing_txs[seq] = val
-        
-        if missing_txs:
-            output(f"{self.node_name} sending {len(missing_txs)} missing txs to {p}")
-            send(('CATCHUP_RESPONSE', missing_txs), to=peer_proc)
-
-    def receive(msg=('CATCHUP_RESPONSE', missing_txs), from_=p):
+        missing = [(s, v) for (s, v) in self.committed_log.items() if s > last_exec]
+        missing_sorted = sorted(missing, key=lambda e: e[0])
+        send(('CATCHUP_RESPONSE', missing_sorted), to=requester)
+    
+    def receive(msg=('CATCHUP_RESPONSE', entries), from_=p):
         if self.is_failed:
             return
-            
-        output(f"{self.node_name} received catch-up data from {p}: {len(missing_txs)} txs")
-        
-        # Update committed log with missing transactions
-        updated = False
-        for seq, val in missing_txs.items():
-            if seq not in self.committed_log:
-                self.committed_log[seq] = val
-                updated = True
-        
-        if updated:
-            execute_committed()
+        for (seq, val) in entries:
+            if seq <= self.last_executed_seq:
+                continue
+            # Store then try to execute in order
+            self.committed_log[seq] = val
+        execute_committed()
     
     def receive(msg=('RESET',)):
         output(f"{self.node_name} RESET. Peers: {len(self.peers)}")
@@ -499,6 +537,9 @@ class Node(process):
         self.client_replies = {}
         self.is_failed = False
         self.new_view_messages = []
+        self.last_leader_msg = time.time()
+        self.buffered_prepare = None
+        self.last_prepare_received_time = 0.0
     
     # === Print Functions ===
     
@@ -612,6 +653,10 @@ def main():
                     send(('RECOVER',), to=node_map[name])
                 else:
                     send(('FAIL',), to=node_map[name])
+        else:
+            # Default: all nodes are live for this set
+            for name in node_names:
+                send(('RECOVER',), to=node_map[name])
         
         # Check if quorum is met for this set
         live_count = len(test_set['live_nodes']) if test_set['live_nodes'] else 5
@@ -630,10 +675,14 @@ def main():
                 if tx_data == ('LF',):
                     output("Executing LF (Leader Fail)")
                     # Fail n1 explicitly (node at index 0)
-                    failed_leader = nodes_list[0]
-                    send(('FAIL',), to=failed_leader)
-                    # Broadcast immediate leader failure notification
-                    send(('LEADER_FAILED', failed_leader), to=nodes)
+                    failed_leader = nodes_list[0]
+
+                    send(('FAIL',), to=failed_leader)
+
+                    # Broadcast immediate leader failure notification
+
+                    send(('LEADER_FAILED', failed_leader), to=nodes)
+
                     time.sleep(0.5) # Reduced for faster recovery
                     continue
                 
