@@ -480,7 +480,7 @@ class Node(process):
         if self.status == 'LEADER':
             self.is_failed = True
             output(f"{self.node_name} (LEADER) FAILED by LF command")
-    
+
     def receive(msg=('LEADER_FAILED', failed_leader)):
 
         # Immediate view change when leader failed
@@ -491,6 +491,14 @@ class Node(process):
 
             start_election()
 
+    def receive(msg=('FORCE_ELECTION',)):
+        if self.is_failed:
+            return
+        # Force a new election without killing the node
+        self.status = 'FOLLOWER'
+        self.buffered_prepare = None
+        self.last_leader_msg = 0.0
+        start_election()
     
 
     def receive(msg=('RECOVER',)):
@@ -674,15 +682,8 @@ def main():
             elif tx_type == 'TX':
                 if tx_data == ('LF',):
                     output("Executing LF (Leader Fail)")
-                    # Fail n1 explicitly (node at index 0)
-                    failed_leader = nodes_list[0]
-
-                    send(('FAIL',), to=failed_leader)
-
-                    # Broadcast immediate leader failure notification
-
-                    send(('LEADER_FAILED', failed_leader), to=nodes)
-
+                    # Trigger an election without killing any node
+                    send(('FORCE_ELECTION',), to=nodes)
                     time.sleep(0.5) # Reduced for faster recovery
                     continue
                 
