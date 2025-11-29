@@ -4,7 +4,7 @@ import csv
 import random
 
 # Configuration
-TIMEOUT = 5.0
+TIMEOUT = 12.0  # Allow extra time for leader failover before clients give up
 HEARTBEAT_INTERVAL = 0.5
 HEARTBEAT_TIMEOUT = 1.0  # Reduced from 3.0 for faster leader election after LF
 ELECTION_TIMEOUT = 1.5  # t: follower timer reset by leader traffic
@@ -104,6 +104,8 @@ class Node(process):
         # Logs
         self.accept_log = set()  # Set of (ballot, seq, val)
         self.committed_log = {}  # seq -> val
+        # Gap recovery tracking: (start,end) -> first request time
+        self.pending_gap_requests = {}
         
         # Leader election
         self.promises = {}  # ballot -> {node -> accept_log}
@@ -412,17 +414,29 @@ class Node(process):
         if seq <= self.last_executed_seq:
             output(f"{self.node_name} SKIPPING already-executed seq={seq}")
             return
-        
+
+        # Detect and request any gap before this commit
+        expected_seq = self.last_executed_seq + 1
+        if seq > expected_seq:
+            request_missing_slots(expected_seq, seq - 1)
+
         self.committed_log[seq] = val
         output(f"{self.node_name} COMMITTED seq={seq}")
         execute_committed()
-    
+
     def execute_committed():
         """Execute all committed transactions in order"""
+        # If we see future commits but are missing the next one, actively fetch it.
+        if self.committed_log:
+            expected = self.last_executed_seq + 1
+            highest_seen = max(self.committed_log.keys())
+            if expected <= highest_seen and expected not in self.committed_log:
+                request_missing_slots(expected, expected)
+
         while self.last_executed_seq + 1 in self.committed_log:
             seq = self.last_executed_seq + 1
             val = self.committed_log[seq]
-            
+
             if val == 'NO-OP':
                 self.last_executed_seq = seq
                 continue
@@ -508,10 +522,59 @@ class Node(process):
         self.buffered_prepare = None
         # Actively request missing commits since leader may not change
         send(('CATCHUP_REQUEST', self.last_executed_seq, self), to=self.peers)
-        
+
         # No need for active catch-up - NEW-VIEW will synchronize state
         # send(('CATCHUP_REQUEST', self.last_executed_seq, self), to=self.peers)
-    
+
+    def request_missing_slots(start_seq, end_seq):
+        """Actively request missing committed slots in [start_seq, end_seq]."""
+        key = (start_seq, end_seq)
+        if key in self.pending_gap_requests:
+            return
+        self.pending_gap_requests[key] = time.time()
+        send(('MISSING_REQ', start_seq, end_seq, self), to=self.peers)
+
+    def propose_gap_value(seq):
+        """Leader proposes a value to fill a gap (reuse any accepted value, else NO-OP)."""
+        # If we already have an accepted value for this seq, reuse it; otherwise NO-OP.
+        existing = [e for e in self.accept_log if e[1] == seq]
+        if existing:
+            best = max(existing)
+            val = best[2]
+        else:
+            val = 'NO-OP'
+        self.accept_log.add((self.ballot_num, seq, val))
+        if seq >= self.next_seq:
+            self.next_seq = seq + 1
+        send(('ACCEPT', self.ballot_num, seq, val), to=self.peers)
+        send(('ACCEPTED', self.ballot_num, seq, val, self), to=self)
+
+    def receive(msg=('MISSING_REQ', start_seq, end_seq, requester), from_=p):
+        if self.is_failed:
+            return
+        entries = []
+        for s in range(start_seq, end_seq + 1):
+            if s in self.committed_log:
+                entries.append((s, self.committed_log[s]))
+            elif self.status == 'LEADER':
+                # Proactively fill the gap so requester can progress
+                propose_gap_value(s)
+        if entries:
+            send(('MISSING_RESP', entries), to=requester)
+
+    def receive(msg=('MISSING_RESP', entries), from_=p):
+        if self.is_failed:
+            return
+        updated = False
+        for (seq, val) in entries:
+            if seq not in self.committed_log:
+                self.committed_log[seq] = val
+                updated = True
+                # Clear any pending requests covering this sequence
+                self.pending_gap_requests = {rng: t for (rng, t) in self.pending_gap_requests.items() if not (rng[0] <= seq <= rng[1])}
+        if updated:
+            execute_committed()
+
     def receive(msg=('CATCHUP_REQUEST', last_exec, requester), from_=p):
         if self.is_failed:
             return
@@ -586,6 +649,15 @@ class Node(process):
 
 # Main Function
 def main():
+    # Allow CSV selection via CLI: `demo` (default), `testcases`, or a custom path
+    csv_arg = sys.argv[1] if len(sys.argv) > 1 else 'demo'
+    csv_map = {
+        'demo': 'CSE535-F25-Project-1-Demo-Tests.csv',
+        'testcases': 'CSE535-F25-Project-1-Testcases.csv'
+    }
+    csv_file = csv_map.get(csv_arg.lower(), csv_arg)
+    output(f"Using test file: {csv_file}")
+    
     # Setup 5 nodes
     node_names = ['n1', 'n2', 'n3', 'n4', 'n5']
     nodes = new(Node, num=5)
@@ -600,8 +672,6 @@ def main():
     node_map = {name: node for name, node in zip(node_names, nodes_list)}
     
     # Read CSV file
-    csv_file = 'CSE535-F25-Project-1-Testcases.csv'
-    
     test_sets = []
     current_set = None
     
@@ -699,8 +769,11 @@ def main():
                     results = setof((t, r), received(('TX_RESULT', t, r)), t == tx_data)
                     _, result = results.pop()
                     output(f"Tx {tx_data} -> {result}")
-                elif timeout(5.0):
+                elif timeout(TIMEOUT * 3):
                     output(f"Tx {tx_data} -> TIMEOUT")
+        
+        # Allow in-flight commits to settle before snapshotting DB
+        time.sleep(TIMEOUT * 2)
         
         # Print DB
         output(f"\n=== End of Set {test_set['id']} ===")
