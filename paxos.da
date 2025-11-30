@@ -4,7 +4,7 @@ import csv
 import random
 
 # Configuration
-TIMEOUT = 12.0  # Allow extra time for leader failover before clients give up
+TIMEOUT = 12.0  # Allow leader change and commit to finish without excessive delay
 HEARTBEAT_INTERVAL = 0.5
 HEARTBEAT_TIMEOUT = 1.0  # Reduced from 3.0 for faster leader election after LF
 ELECTION_TIMEOUT = 1.5  # t: follower timer reset by leader traffic
@@ -85,6 +85,110 @@ class Client(process):
             elif timeout(TIMEOUT * 2):
                 self.pending = None
                 return "TIMEOUT"
+
+# Driver process to orchestrate test sets with proper awaits
+class Driver(process):
+    def setup(test_sets:list, node_names:list, node_map:dict, nodes:set, client_proc, all_clients:set):
+        self.test_sets = test_sets
+        self.node_names = node_names
+        self.node_map = node_map
+        self.nodes = nodes
+        self.client = client_proc
+        self.all_clients = all_clients
+    
+    def run():
+        # Initialize known clients/balances on all nodes
+        if self.all_clients:
+            send(('INIT_CLIENTS', list(self.all_clients)), to=self.nodes)
+        
+        for test_set in self.test_sets:
+            output(f"\n=== Processing Set {test_set['id']} ===")
+            
+            # Handle live nodes and track current live set
+            if test_set['live_nodes']:
+                live_nodes_set = set(test_set['live_nodes'])
+                for name in self.node_names:
+                    if name in live_nodes_set:
+                        send(('RECOVER',), to=self.node_map[name])
+                    else:
+                        send(('FAIL',), to=self.node_map[name])
+            else:
+                live_nodes_set = set(self.node_names)
+                send(('RECOVER',), to=self.nodes)
+            
+            def live_count():
+                return len(live_nodes_set)
+            
+            quorum_met = live_count() >= 3
+            if not quorum_met:
+                output(f"WARNING: Only {live_count()} live nodes - Quorum NOT met, skipping transactions")
+            
+            # Track a notion of current leader name (best-effort, driver-side)
+            current_leader_name = None
+            if live_nodes_set:
+                current_leader_name = sorted(list(live_nodes_set))[0]
+            
+            # Process transactions
+            for tx_type, tx_data in test_set['transactions']:
+                if tx_type == 'FAIL':
+                    send(('FAIL',), to=self.node_map[tx_data])
+                    live_nodes_set.discard(tx_data)
+                    if live_count() < 3:
+                        quorum_met = False
+                elif tx_type == 'RECOVER':
+                    send(('RECOVER',), to=self.node_map[tx_data])
+                    live_nodes_set.add(tx_data)
+                    if live_count() >= 3:
+                        quorum_met = True
+                elif tx_type == 'TX':
+                    if tx_data == ('LF',):
+                        output("Executing LF (Leader Fail)")
+                        leader_to_fail = None
+                        if current_leader_name and current_leader_name in live_nodes_set:
+                            leader_to_fail = current_leader_name
+                        elif live_nodes_set:
+                            leader_to_fail = sorted(list(live_nodes_set))[0]
+                        
+                        if leader_to_fail:
+                            send(('FAIL',), to=self.node_map[leader_to_fail])
+                            live_nodes_set.discard(leader_to_fail)
+                            output(f"LF killed leader {leader_to_fail}")
+                        
+                        send(('FORCE_ELECTION',), to=self.nodes)
+                        
+                        if live_count() < 3:
+                            quorum_met = False
+                            output(f"WARNING: LF reduced live nodes to {live_count()} - Quorum NOT met, remaining TX skipped")
+                        else:
+                            current_leader_name = sorted(list(live_nodes_set))[0] if live_nodes_set else None
+                        time.sleep(0.5)
+                        continue
+                    
+                    # Skip transaction if quorum not met
+                    if not quorum_met:
+                        output(f"Tx {tx_data} -> SKIPPED (no quorum)")
+                        continue
+                    
+                    send(('TRIGGER_TX', tx_data), to=self.client)
+                    
+                    # Wait for result from client
+                    if await(some(received(('TX_RESULT', tx_val, res), from_=self.client), has= tx_val == tx_data)):
+                        results = setof(res, received(('TX_RESULT', tx_val, res), from_=self.client), tx_val == tx_data)
+                        result = results.pop()
+                        output(f"Tx {tx_data} -> {result}")
+                    elif timeout(TIMEOUT * 2.5):
+                        output(f"Tx {tx_data} -> TIMEOUT")
+            
+            # Allow in-flight commits to settle before snapshotting DB
+            time.sleep(TIMEOUT * 0.5)
+            
+            # Print DB
+            output(f"\n=== End of Set {test_set['id']} ===")
+            send(('PRINT_DB',), to=self.nodes)
+            time.sleep(0.5)
+        
+        # Cleanup
+        send(('DONE',), to=self.client)
 
 # Node Process
 class Node(process):
@@ -591,6 +695,13 @@ class Node(process):
             # Store then try to execute in order
             self.committed_log[seq] = val
         execute_committed()
+
+    def receive(msg=('INIT_CLIENTS', clients)):
+        # Pre-seed known clients and default balances
+        for c in clients:
+            self.known_clients.add(c)
+            if c not in self.db:
+                self.db[c] = 10
     
     def receive(msg=('RESET',)):
         output(f"{self.node_name} RESET. Peers: {len(self.peers)}")
@@ -673,6 +784,7 @@ def main():
     
     # Read CSV file
     test_sets = []
+    all_clients = set()
     current_set = None
     
     with open(csv_file, 'r') as f:
@@ -706,7 +818,16 @@ def main():
                 else:
                     tx = parse_transaction(tx_str)
                     if tx:
+                        # Skip LF when collecting clients
+                        if tx == ('LF',):
+                            current_set['transactions'].append(('TX', tx))
+                            continue
                         current_set['transactions'].append(('TX', tx))
+                        # Track client ids appearing in transactions
+                        if len(tx) == 3:
+                            all_clients.add(tx[0]); all_clients.add(tx[1])
+                        elif len(tx) == 1:
+                            all_clients.add(tx[0])
         
         if current_set:
             test_sets.append(current_set)
@@ -715,70 +836,11 @@ def main():
     client = new(Client, num=1)
     setup(client, (0, set(nodes_list), nodes_list[0]))
     start(client)
-    
-    # Run test sets
-    for test_set in test_sets:
-        output(f"\n=== Processing Set {test_set['id']} ===")
-        
-        # Reset all nodes - Keep DB, reset consensus
-        # send(('RESET',), to=nodes)
-        # time.sleep(0.5)
-        
-        # Handle live nodes
-        if test_set['live_nodes']:
-            for name in node_names:
-                if name in test_set['live_nodes']:
-                    send(('RECOVER',), to=node_map[name])
-                else:
-                    send(('FAIL',), to=node_map[name])
-        else:
-            # Default: all nodes are live for this set
-            for name in node_names:
-                send(('RECOVER',), to=node_map[name])
-        
-        # Check if quorum is met for this set
-        live_count = len(test_set['live_nodes']) if test_set['live_nodes'] else 5
-        quorum_met = live_count >= 3
-        
-        if not quorum_met:
-            output(f"WARNING: Only {live_count} live nodes - Quorum NOT met, skipping transactions")
-        
-        # Process transactions
-        for tx_type, tx_data in test_set['transactions']:
-            if tx_type == 'FAIL':
-                send(('FAIL',), to=node_map[tx_data])
-            elif tx_type == 'RECOVER':
-                send(('RECOVER',), to=node_map[tx_data])
-            elif tx_type == 'TX':
-                if tx_data == ('LF',):
-                    output("Executing LF (Leader Fail)")
-                    # Trigger an election without killing any node
-                    send(('FORCE_ELECTION',), to=nodes)
-                    time.sleep(0.5) # Reduced for faster recovery
-                    continue
-                
-                # Skip transaction if quorum not met
-                if not quorum_met:
-                    output(f"Tx {tx_data} -> SKIPPED (no quorum)")
-                    continue
-                
-                send(('TRIGGER_TX', tx_data), to=client)
-                
-                # Wait for result
-                if await(some(received(('TX_RESULT', tx_val, _)), has= tx_val == tx_data)):
-                    results = setof((t, r), received(('TX_RESULT', t, r)), t == tx_data)
-                    _, result = results.pop()
-                    output(f"Tx {tx_data} -> {result}")
-                elif timeout(TIMEOUT * 3):
-                    output(f"Tx {tx_data} -> TIMEOUT")
-        
-        # Allow in-flight commits to settle before snapshotting DB
-        time.sleep(TIMEOUT * 2)
-        
-        # Print DB
-        output(f"\n=== End of Set {test_set['id']} ===")
-        send(('PRINT_DB',), to=nodes)
-        time.sleep(0.5)
-    
-    # Cleanup
-    send(('DONE',), to=client)
+
+    # Create driver
+    driver = new(Driver, num=1)
+    setup(driver, (test_sets, node_names, node_map, set(nodes_list), client, all_clients))
+    start(driver)
+
+    # Keep main alive until driver finishes by waiting for DONE
+    await(received(('DONE',)))
