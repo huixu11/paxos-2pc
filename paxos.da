@@ -2,9 +2,10 @@ import sys
 import time
 import csv
 import random
+import threading
 
 # Configuration
-TIMEOUT = 12.0  # Allow leader change and commit to finish without excessive delay
+TIMEOUT = 5.0  # Shorter to improve runtime while keeping quorum progress
 HEARTBEAT_INTERVAL = 0.5
 HEARTBEAT_TIMEOUT = 1.0  # Reduced from 3.0 for faster leader election after LF
 ELECTION_TIMEOUT = 1.5  # t: follower timer reset by leader traffic
@@ -41,9 +42,11 @@ class Client(process):
         self.leader = initial_leader
         self.request_id = 0
         self.pending = None  # (req_id, tx, timestamp)
+        # Minimal startup log
         output(f"Client {client_id} setup with leader {initial_leader}")
     
     def run():
+        # Client run loop idle until DONE
         output("Client started running")
         await(some(received(('DONE',))))
         output("Client finishing")
@@ -51,6 +54,7 @@ class Client(process):
     def receive(msg=('TRIGGER_TX', tx), from_=parent):
         output(f"Client triggered for {tx}")
         result = request_transaction(tx)
+        output(f"Client completed {tx} with result {result}")
         send(('TX_RESULT', tx, result), to=parent)
     
     def request_transaction(tx):
@@ -59,32 +63,32 @@ class Client(process):
         timestamp = time.time()
         self.pending = (req_id, tx, timestamp)
         
-        # Send to leader
-        output(f"Client sending {req_id} to {self.leader}")
-        send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id), to=self.leader)
+        attempts = 0
+        wait_interval = TIMEOUT  # base retry interval
         
-        # Wait for reply with timeout
-        if await(some(received(('CLIENT_REPLY', r_id, _), from_=sender_proc), has= r_id == req_id)):
-            replies = setof((p, res), received(('CLIENT_REPLY', r_id, res), from_=p), r_id == req_id)
-            new_leader, result = replies.pop()
-            self.leader = new_leader
-            self.pending = None
-            return result
-        elif timeout(TIMEOUT):
-            output("Client timeout, broadcasting...")
-            # Broadcast to all nodes on timeout
-            send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id), to=self.nodes)
-            
-            # Wait again
-            if await(some(received(('CLIENT_REPLY', r_id, _), from_=sender_proc), has= r_id == req_id)):
+        while True:
+            # Broadcast to all known nodes to ensure delivery even if leader fails
+            send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id, self), to=self.nodes)
+
+            # Start a per-attempt timer that sends a local timeout message
+            attempt_id = attempts
+            timer = threading.Timer(wait_interval, lambda: send(('CLIENT_TIMEOUT', req_id, attempt_id), to=self))
+            timer.start()
+
+            if await(some(received(('CLIENT_REPLY', r_id, _), from_=sender_proc), has= r_id == req_id) or some(received(('CLIENT_TIMEOUT', t_id, t_attempt)), has= t_id == req_id and t_attempt == attempts)):
                 replies = setof((p, res), received(('CLIENT_REPLY', r_id, res), from_=p), r_id == req_id)
-                new_leader, result = replies.pop()
-                self.leader = new_leader
-                self.pending = None
-                return result
-            elif timeout(TIMEOUT * 2):
-                self.pending = None
-                return "TIMEOUT"
+                if replies:
+                    timer.cancel()
+                    new_leader, result = replies.pop()
+                    output(f"Client received reply for {req_id} from {new_leader}: {result}")
+                    self.leader = new_leader
+                    self.pending = None
+                    return result
+            
+            timer.cancel()
+            attempts += 1
+            output(f"Client retrying {req_id}, attempt {attempts}")
+            continue
 
 # Driver process to orchestrate test sets with proper awaits
 class Driver(process):
@@ -115,31 +119,37 @@ class Driver(process):
             else:
                 live_nodes_set = set(self.node_names)
                 send(('RECOVER',), to=self.nodes)
+
+            # Give RECOVER/FAIL a brief window to settle
+            time.sleep(TIMEOUT * 0.05)
             
             def live_count():
                 return len(live_nodes_set)
             
-            quorum_met = live_count() >= 3
+            def update_quorum():
+                q = live_count() >= 3
+                if q:
+                    send(('RESUME_QUORUM',), to=self.nodes)
+                else:
+                    send(('PAUSE_NO_QUORUM',), to=self.nodes)
+                return q
+            
+            quorum_met = update_quorum()
             if not quorum_met:
                 output(f"WARNING: Only {live_count()} live nodes - Quorum NOT met, skipping transactions")
             
-            # Track a notion of current leader name (best-effort, driver-side)
-            current_leader_name = None
-            if live_nodes_set:
-                current_leader_name = sorted(list(live_nodes_set))[0]
+            current_leader_name = sorted(list(live_nodes_set))[0] if live_nodes_set else None
             
-            # Process transactions
+            # Process transactions sequentially
             for tx_type, tx_data in test_set['transactions']:
                 if tx_type == 'FAIL':
                     send(('FAIL',), to=self.node_map[tx_data])
                     live_nodes_set.discard(tx_data)
-                    if live_count() < 3:
-                        quorum_met = False
+                    quorum_met = update_quorum()
                 elif tx_type == 'RECOVER':
                     send(('RECOVER',), to=self.node_map[tx_data])
                     live_nodes_set.add(tx_data)
-                    if live_count() >= 3:
-                        quorum_met = True
+                    quorum_met = update_quorum()
                 elif tx_type == 'TX':
                     if tx_data == ('LF',):
                         output("Executing LF (Leader Fail)")
@@ -150,45 +160,44 @@ class Driver(process):
                             leader_to_fail = sorted(list(live_nodes_set))[0]
                         
                         if leader_to_fail:
-                            send(('FAIL',), to=self.node_map[leader_to_fail])
+                            send(('FAIL_LEADER',), to=self.node_map[leader_to_fail])
                             live_nodes_set.discard(leader_to_fail)
                             output(f"LF killed leader {leader_to_fail}")
                         
-                        send(('FORCE_ELECTION',), to=self.nodes)
+                        # Trigger election among remaining live nodes only
+                        live_procs = set(self.node_map[n] for n in live_nodes_set)
+                        if live_procs:
+                            send(('FORCE_ELECTION',), to=live_procs)
                         
-                        if live_count() < 3:
-                            quorum_met = False
+                        quorum_met = update_quorum()
+                        if not quorum_met:
                             output(f"WARNING: LF reduced live nodes to {live_count()} - Quorum NOT met, remaining TX skipped")
                         else:
                             current_leader_name = sorted(list(live_nodes_set))[0] if live_nodes_set else None
-                        time.sleep(0.5)
+                        # Give the cluster time to elect a new leader before next request
+                        time.sleep(TIMEOUT * 0.5)
                         continue
                     
-                    # Skip transaction if quorum not met
                     if not quorum_met:
                         output(f"Tx {tx_data} -> SKIPPED (no quorum)")
                         continue
                     
                     send(('TRIGGER_TX', tx_data), to=self.client)
                     
-                    # Wait for result from client
-                    if await(some(received(('TX_RESULT', tx_val, res), from_=self.client), has= tx_val == tx_data)):
-                        results = setof(res, received(('TX_RESULT', tx_val, res), from_=self.client), tx_val == tx_data)
-                        result = results.pop()
-                        output(f"Tx {tx_data} -> {result}")
-                    elif timeout(TIMEOUT * 2.5):
-                        output(f"Tx {tx_data} -> TIMEOUT")
+                    await(some(received(('TX_RESULT', tx_val, res)), has= tx_val == tx_data))
+                    results = setof(res, received(('TX_RESULT', tx_val, res)), tx_val == tx_data)
+                    result = results.pop()
+                    output(f"Tx {tx_data} -> {result}")
             
-            # Allow in-flight commits to settle before snapshotting DB
-            time.sleep(TIMEOUT * 0.5)
-            
-            # Print DB
+            # Short settle, then print DB
+            time.sleep(TIMEOUT * 0.05)
             output(f"\n=== End of Set {test_set['id']} ===")
             send(('PRINT_DB',), to=self.nodes)
             time.sleep(0.5)
         
         # Cleanup
         send(('DONE',), to=self.client)
+        send(('STOP',), to=self.nodes)
 
 # Node Process
 class Node(process):
@@ -196,6 +205,7 @@ class Node(process):
         self.node_name = node_name
         self.cluster_size = len(peers)  # Total cluster size for quorum checks
         self.peers = peers - {self}
+        self.shutdown = False
         
         # Paxos state
         self.is_initial_leader = is_initial_leader
@@ -227,9 +237,12 @@ class Node(process):
         # Client tracking for exactly-once
         self.client_replies = {}  # (client_id, req_id) -> (client_proc, result)
         self.pending_requests = set()  # Set of (client_id, req_id) being processed
+        self.sent_replies = set()      # Track replies already sent to clients
         
         # Failure state
         self.is_failed = False
+        self.recover_quiet_until = 0.0  # Suppress elections right after recovery
+        self.pause_no_quorum = False    # Pause elections/heartbeats when cluster lacks quorum
 
         # Election timers/backoff
         self.last_leader_msg = time.time()
@@ -240,13 +253,18 @@ class Node(process):
         self.new_view_messages = []
     
     def run():
-        while True:
+        while not self.shutdown:
             if self.is_failed:
+                if self.shutdown:
+                    break
                 await(not self.is_failed)
                 continue
             
             # Leader sends heartbeats
             if self.status == 'LEADER':
+                if self.pause_no_quorum:
+                    await(self.pause_no_quorum == False)
+                    continue
                 send(('HEARTBEAT', self.ballot_num, self), to=self.peers)
                 
                 if await(some(received(_))):
@@ -256,6 +274,10 @@ class Node(process):
             
             # Follower checks for heartbeat timeout
             elif self.status == 'FOLLOWER':
+                # When cluster is below quorum or this node is failed, stay silent
+                if self.is_failed or self.pause_no_quorum:
+                    await(self.pause_no_quorum == False and self.is_failed == False)
+                    continue
                 old_timer = self.last_leader_msg
                 jitter = random.uniform(0, ELECTION_JITTER)
                 to_wait = (ELECTION_TIMEOUT + jitter) - (time.time() - old_timer)
@@ -278,6 +300,10 @@ class Node(process):
     
     def handle_timer_expiry():
         if self.is_failed:
+            return
+        if time.time() < self.recover_quiet_until:
+            return
+        if self.pause_no_quorum:
             return
         
         # Honor any buffered PREPARE with the highest ballot seen so far
@@ -355,6 +381,7 @@ class Node(process):
         self.status = 'LEADER'
         self.leader = self
         self.current_leader = self  # Track current leader
+        self.accepted_votes = {}  # Reset vote tracking for new view
         
         # Construct NEW-VIEW from quorum AcceptLogs
         all_entries = set()
@@ -381,9 +408,7 @@ class Node(process):
         # Vote for own proposals in NEW-VIEW
         for (ballot, seq, val) in new_log:
             key = (ballot, seq)
-            if key not in self.accepted_votes:
-                self.accepted_votes[key] = set()
-            self.accepted_votes[key].add(self)
+            self.accepted_votes[key] = {self}
         
         output(f"Leader {self.node_name} NEW-VIEW: {len(new_log)} entries, seq range 1-{max_seq}")
         
@@ -392,6 +417,10 @@ class Node(process):
         nv_msg = ('NEW-VIEW', self.ballot_num, ordered_new_log)
         self.new_view_messages.append(nv_msg)
         send(nv_msg, to=self.peers)
+        # Also send ACCEPT to ensure peers record values even if they ignore NEW-VIEW
+        for (_, seq, val) in ordered_new_log:
+            send(('ACCEPT', self.ballot_num, seq, val), to=self.peers)
+            send(('ACCEPTED', self.ballot_num, seq, val, self), to=self)
     
     def receive(msg=('NEW-VIEW', b, new_log), from_=leader):
         if self.is_failed:
@@ -404,12 +433,13 @@ class Node(process):
             self.leader = leader
             self.current_leader = leader
             self.accept_log = set(new_log)
+            if new_log:
+                self.next_seq = max(e[1] for e in new_log) + 1
             self.last_leader_msg = time.time()
             self.buffered_prepare = None
             self.new_view_messages.append(('NEW-VIEW', b, new_log))
             
-            # Per project spec: treat as Accept messages, send ACCEPTED
-            # Do NOT commit/execute here - wait for COMMIT messages from leader
+            # Treat as Accept messages, send ACCEPTED, do not commit/execute yet
             for (ballot, seq, val) in new_log:
                 send(('ACCEPTED', ballot, seq, val, self), to=leader)
     
@@ -418,6 +448,8 @@ class Node(process):
     def receive(msg=('HEARTBEAT', b, leader_proc), from_=p):
 
         if self.is_failed:
+            return
+        if self.pause_no_quorum:
             return
         
         if b >= self.ballot_num:
@@ -433,28 +465,30 @@ class Node(process):
 
     # === Normal Operations ===
     
-    def receive(msg=('CLIENT_REQUEST', tx, timestamp, cid, req_id), from_=client):
+    def receive(msg=('CLIENT_REQUEST', tx, timestamp, cid, req_id, client_proc), from_=client_sender):
         if self.is_failed:
-            output(f"{self.node_name} ignoring REQUEST {req_id} because is_failed=True")
             return
         
-        output(f"{self.node_name} received REQUEST {req_id} from client (is_failed={self.is_failed})")
+        # Suppress verbose request logs; keep minimal errors
         
         # Check if already processed
         if (cid, req_id) in self.client_replies:
-            client_proc, result = self.client_replies[(cid, req_id)]
-            send(('CLIENT_REPLY', req_id, result), to=client_proc)
+            saved_client_proc, result = self.client_replies[(cid, req_id)]
+            send(('CLIENT_REPLY', req_id, result), to=saved_client_proc)
             return
         
         # Forward to leader if not leader
         if self.status != 'LEADER':
             if self.leader:
-                send(('CLIENT_REQUEST', tx, timestamp, cid, req_id), to=self.leader)
+                send(('CLIENT_REQUEST', tx, timestamp, cid, req_id, client_proc), to=self.leader)
+            else:
+                # No known leader yet: start election and broadcast to peers to avoid drop
+                start_election()
+                send(('CLIENT_REQUEST', tx, timestamp, cid, req_id, client_proc), to=self.peers)
             return
         
         # Check if already being processed (pending)
         if (cid, req_id) in self.pending_requests:
-            output(f"Leader {self.node_name} ignoring duplicate REQUEST {req_id}")
             return
         
         # Mark as pending
@@ -465,11 +499,10 @@ class Node(process):
         self.next_seq += 1
         
         # Store client process in value so we can reply later
-        val = (tx, timestamp, cid, req_id, client)
+        val = (tx, timestamp, cid, req_id, client_proc)
         self.accept_log.add((self.ballot_num, seq, val))
         
         send(('ACCEPT', self.ballot_num, seq, val), to=self.peers)
-        output(f"Leader {self.node_name} proposed {seq}")
         # Self-vote
         send(('ACCEPTED', self.ballot_num, seq, val, self), to=self)
     
@@ -484,10 +517,12 @@ class Node(process):
             self.last_leader_msg = time.time()
             self.accept_log.add((b, seq, val))
             send(('ACCEPTED', b, seq, val, self), to=leader)
-            output(f"{self.node_name} accepted {seq} from {leader}")
     
     def receive(msg=('ACCEPTED', b, seq, val, node), from_=_):
         if self.is_failed or self.status != 'LEADER' or b != self.ballot_num:
+            return
+        # Ignore if already committed/executed
+        if seq in self.committed_log or seq <= self.last_executed_seq:
             return
         
         key = (b, seq)
@@ -525,7 +560,7 @@ class Node(process):
             request_missing_slots(expected_seq, seq - 1)
 
         self.committed_log[seq] = val
-        output(f"{self.node_name} COMMITTED seq={seq}")
+        # Commit log; executed output handled in execute_committed
         execute_committed()
 
     def execute_committed():
@@ -553,7 +588,6 @@ class Node(process):
                 sender, receiver, amount = tx
                 self.known_clients.add(sender)
                 self.known_clients.add(receiver)
-                output(f"Executing {tx} on {self.node_name}")
                 
                 sender_bal = self.db.get(sender, 10)
                 receiver_bal = self.db.get(receiver, 10)
@@ -582,9 +616,12 @@ class Node(process):
             # Remove from pending set
             self.pending_requests.discard((cid, req_id))
             
-            # Send reply if leader
-            if self.status == 'LEADER':
+            # Send reply (leader or backup) once
+            if (cid, req_id) not in self.sent_replies:
+                # Debug: trace replies to verify client sees them
+                output(f"{self.node_name} sending CLIENT_REPLY for {req_id} result={result} to {client_proc}")
                 send(('CLIENT_REPLY', req_id, result), to=client_proc)
+                self.sent_replies.add((cid, req_id))
             
             self.last_executed_seq = seq
     
@@ -599,6 +636,11 @@ class Node(process):
             self.is_failed = True
             output(f"{self.node_name} (LEADER) FAILED by LF command")
 
+    def receive(msg=('STOP',)):
+        # Graceful shutdown after driver completes
+        self.shutdown = True
+        self.is_failed = True
+        self.pause_no_quorum = True
     def receive(msg=('LEADER_FAILED', failed_leader)):
 
         # Immediate view change when leader failed
@@ -624,11 +666,21 @@ class Node(process):
         self.is_failed = False
         self.last_leader_msg = time.time()
         self.buffered_prepare = None
+        self.recover_quiet_until = time.time() + (TIMEOUT * 0.5)
         # Actively request missing commits since leader may not change
         send(('CATCHUP_REQUEST', self.last_executed_seq, self), to=self.peers)
 
         # No need for active catch-up - NEW-VIEW will synchronize state
         # send(('CATCHUP_REQUEST', self.last_executed_seq, self), to=self.peers)
+
+    def receive(msg=('PAUSE_NO_QUORUM',)):
+        self.pause_no_quorum = True
+        self.last_leader_msg = time.time()
+        self.buffered_prepare = None
+
+    def receive(msg=('RESUME_QUORUM',)):
+        self.pause_no_quorum = False
+        self.last_leader_msg = time.time()
 
     def request_missing_slots(start_seq, end_seq):
         """Actively request missing committed slots in [start_seq, end_seq]."""
