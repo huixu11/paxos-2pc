@@ -88,6 +88,9 @@ class Client(process):
             timer.cancel()
             attempts += 1
             output(f"Client retrying {req_id}, attempt {attempts}")
+            # If we have been retrying for a while, nudge nodes to elect a leader
+            if attempts % 3 == 0:
+                send(('FORCE_ELECTION',), to=self.nodes)
             continue
 
 # Driver process to orchestrate test sets with proper awaits
@@ -346,8 +349,9 @@ class Node(process):
         
         self.last_prepare_received_time = time.time()
         
-        if timer_has_expired() and b > self.ballot_num:
-            output(f"{self.node_name} voting for {p} (ballot {b}) after timer expiry")
+        # Respond immediately to higher ballots to avoid election stalls
+        if b > self.ballot_num:
+            output(f"{self.node_name} voting for {p} (ballot {b})")
             accept_prepare(b, p)
         else:
             # Buffer the highest PREPARE seen while the timer is still active
@@ -479,12 +483,11 @@ class Node(process):
         
         # Forward to leader if not leader
         if self.status != 'LEADER':
-            if self.leader:
-                send(('CLIENT_REQUEST', tx, timestamp, cid, req_id, client_proc), to=self.leader)
-            else:
-                # No known leader yet: start election and broadcast to peers to avoid drop
+            # Always broadcast to peers to ensure some leader candidate receives it
+            send(('CLIENT_REQUEST', tx, timestamp, cid, req_id, client_proc), to=self.peers)
+            # If no known leader, kick off election locally
+            if self.leader is None:
                 start_election()
-                send(('CLIENT_REQUEST', tx, timestamp, cid, req_id, client_proc), to=self.peers)
             return
         
         # Check if already being processed (pending)
