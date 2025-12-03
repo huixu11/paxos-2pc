@@ -364,14 +364,22 @@ class Node(process):
     def receive(msg=('PREPARE', b), from_=p):
         if self.is_failed:
             return
-        
-        self.last_prepare_received_time = time.time()
-        
-        # Respond immediately to higher ballots to avoid election stalls
+        if self.pause_no_quorum:
+            return
+
+        now = time.time()
+        self.last_prepare_received_time = now
+
+        # If timer hasn't expired yet, just buffer the highest prepare and wait
+        if not timer_has_expired() or now < self.recover_quiet_until:
+            if self.buffered_prepare is None or b > self.buffered_prepare[0]:
+                self.buffered_prepare = (b, p)
+            return
+
+        # Timer expired: respond to higher ballots immediately, otherwise buffer highest
         if b > self.ballot_num:
             accept_prepare(b, p)
         else:
-            # Buffer the highest PREPARE seen while the timer is still active
             if self.buffered_prepare is None or b > self.buffered_prepare[0]:
                 self.buffered_prepare = (b, p)
     
@@ -403,6 +411,8 @@ class Node(process):
         self.leader = self
         self.current_leader = self  # Track current leader
         self.accepted_votes = {}  # Reset vote tracking for new view
+        # Immediately broadcast a heartbeat so followers reset timers to this ballot
+        send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
         
         # Construct NEW-VIEW from quorum AcceptLogs
         all_entries = set()
@@ -653,6 +663,8 @@ class Node(process):
         
     def receive(msg=('FAIL_LEADER',)):
         if self.status == 'LEADER':
+            # Notify peers immediately so their timers expire and they start election
+            send(('LEADER_FAILED', self), to=self.live_peers)
             self.is_failed = True
             output(f"{self.node_name} (LEADER) FAILED by LF command")
 
@@ -686,9 +698,10 @@ class Node(process):
         self.is_failed = False
         self.last_leader_msg = time.time()
         self.buffered_prepare = None
-        self.recover_quiet_until = time.time() + (TIMEOUT * 0.5)
+        # Keep a short quiet period to avoid immediate thrash after recovery
+        self.recover_quiet_until = time.time() + (TIMEOUT * 0.2)
         # Actively request missing commits since leader may not change
-        send(('CATCHUP_REQUEST', self.last_executed_seq, self), to=self.peers)
+        send(('CATCHUP_REQUEST', self.last_executed_seq, self), to=self.live_peers)
 
         # No need for active catch-up - NEW-VIEW will synchronize state
         # send(('CATCHUP_REQUEST', self.last_executed_seq, self), to=self.peers)
@@ -722,7 +735,7 @@ class Node(process):
         self.accept_log.add((self.ballot_num, seq, val))
         if seq >= self.next_seq:
             self.next_seq = seq + 1
-        send(('ACCEPT', self.ballot_num, seq, val), to=self.peers)
+        send(('ACCEPT', self.ballot_num, seq, val), to=self.live_peers)
         send(('ACCEPTED', self.ballot_num, seq, val, self), to=self)
 
     def receive(msg=('MISSING_REQ', start_seq, end_seq, requester), from_=p):
