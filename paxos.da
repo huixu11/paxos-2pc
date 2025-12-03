@@ -107,6 +107,10 @@ class Driver(process):
         if self.all_clients:
             send(('INIT_CLIENTS', list(self.all_clients)), to=self.nodes)
         
+        def push_live_set(live_nodes_set):
+            live_procs = set(self.node_map[n] for n in live_nodes_set)
+            send(('SET_LIVE', live_procs), to=self.nodes)
+        
         for test_set in self.test_sets:
             output(f"\n=== Processing Set {test_set['id']} ===")
             
@@ -123,8 +127,7 @@ class Driver(process):
                 send(('RECOVER',), to=self.nodes)
 
             # Inform nodes of current live set for majority calculations and messaging
-            live_procs = set(self.node_map[n] for n in live_nodes_set)
-            send(('SET_LIVE', live_procs), to=self.nodes)
+            push_live_set(live_nodes_set)
 
             # Give RECOVER/FAIL a brief window to settle
             time.sleep(TIMEOUT * 0.05)
@@ -151,10 +154,12 @@ class Driver(process):
                 if tx_type == 'FAIL':
                     send(('FAIL',), to=self.node_map[tx_data])
                     live_nodes_set.discard(tx_data)
+                    push_live_set(live_nodes_set)
                     quorum_met = update_quorum()
                 elif tx_type == 'RECOVER':
                     send(('RECOVER',), to=self.node_map[tx_data])
                     live_nodes_set.add(tx_data)
+                    push_live_set(live_nodes_set)
                     quorum_met = update_quorum()
                 elif tx_type == 'TX':
                     if tx_data == ('LF',):
@@ -174,6 +179,7 @@ class Driver(process):
                         live_procs = set(self.node_map[n] for n in live_nodes_set)
                         if live_procs:
                             send(('FORCE_ELECTION',), to=live_procs)
+                        push_live_set(live_nodes_set)
                         
                         quorum_met = update_quorum()
                         if not quorum_met:
@@ -190,10 +196,19 @@ class Driver(process):
                     
                     send(('TRIGGER_TX', tx_data), to=self.client)
                     
-                    await(some(received(('TX_RESULT', tx_val, res)), has= tx_val == tx_data))
-                    results = setof(res, received(('TX_RESULT', tx_val, res)), tx_val == tx_data)
-                    result = results.pop()
-                    output(f"Tx {tx_data} -> {result}")
+                    wait_misses = 0
+                    while True:
+                        if await(some(received(('TX_RESULT', tx_val, res)), has= tx_val == tx_data)):
+                            results = setof(res, received(('TX_RESULT', tx_val, res)), tx_val == tx_data)
+                            result = results.pop()
+                            output(f"Tx {tx_data} -> {result}")
+                            break
+                        elif timeout(TIMEOUT):
+                            # If we didn't get a result in time, nudge an election among current live nodes
+                            live_procs = set(self.node_map[n] for n in live_nodes_set)
+                            wait_misses += 1
+                            if live_procs and (wait_misses % 3 == 0):
+                                send(('FORCE_ELECTION',), to=live_procs)
             
             # Short settle, then print DB
             time.sleep(TIMEOUT * 0.05)
@@ -335,8 +350,9 @@ class Node(process):
         
         now = time.time()
         if (now - self.last_prepare_received_time) < PREPARE_BACKOFF:
-            output(f"{self.node_name} skipping PREPARE broadcast (backoff window)")
             self.status = 'FOLLOWER'
+            # Reset timer baseline to avoid tight retry loops when backoff triggers
+            self.last_leader_msg = time.time()
             return
         
         self.status = 'CANDIDATE'
