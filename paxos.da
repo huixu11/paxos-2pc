@@ -87,7 +87,6 @@ class Client(process):
             
             timer.cancel()
             attempts += 1
-            output(f"Client retrying {req_id}, attempt {attempts}")
             # If we have been retrying for a while, nudge nodes to elect a leader
             if attempts % 3 == 0:
                 send(('FORCE_ELECTION',), to=self.nodes)
@@ -122,6 +121,10 @@ class Driver(process):
             else:
                 live_nodes_set = set(self.node_names)
                 send(('RECOVER',), to=self.nodes)
+
+            # Inform nodes of current live set for majority calculations and messaging
+            live_procs = set(self.node_map[n] for n in live_nodes_set)
+            send(('SET_LIVE', live_procs), to=self.nodes)
 
             # Give RECOVER/FAIL a brief window to settle
             time.sleep(TIMEOUT * 0.05)
@@ -208,6 +211,8 @@ class Node(process):
         self.node_name = node_name
         self.cluster_size = len(peers)  # Total cluster size for quorum checks
         self.peers = peers - {self}
+        self.live_peers = set(self.peers)
+        self.live_cluster_size = len(peers)
         self.shutdown = False
         
         # Paxos state
@@ -268,7 +273,7 @@ class Node(process):
                 if self.pause_no_quorum:
                     await(self.pause_no_quorum == False)
                     continue
-                send(('HEARTBEAT', self.ballot_num, self), to=self.peers)
+                send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
                 
                 if await(some(received(_))):
                     pass
@@ -290,7 +295,6 @@ class Node(process):
                 if await(self.last_leader_msg > old_timer):
                     pass
                 elif timeout(to_wait):
-                    output(f"Follower {self.node_name} timer expired; checking leader election.")
                     handle_timer_expiry()
             
             else:  # CANDIDATE
@@ -320,14 +324,12 @@ class Node(process):
         now = time.time()
         # Avoid dueling leaders if we've recently seen another PREPARE
         if (now - self.last_prepare_received_time) < PREPARE_BACKOFF:
-            output(f"{self.node_name} deferring election due to recent PREPARE traffic")
             self.status = 'FOLLOWER'
             return
         
         start_election()
     
     def start_election():
-        output(f"{self.node_name} starting election")
         if self.is_failed:
             return
         
@@ -341,7 +343,7 @@ class Node(process):
         self.ballot_num = (self.ballot_num[0] + 1, self)
         self.promises[self.ballot_num] = {self: set(self.accept_log)}
         
-        send(('PREPARE', self.ballot_num), to=self.peers)
+        send(('PREPARE', self.ballot_num), to=self.live_peers)
     
     def receive(msg=('PREPARE', b), from_=p):
         if self.is_failed:
@@ -351,7 +353,6 @@ class Node(process):
         
         # Respond immediately to higher ballots to avoid election stalls
         if b > self.ballot_num:
-            output(f"{self.node_name} voting for {p} (ballot {b})")
             accept_prepare(b, p)
         else:
             # Buffer the highest PREPARE seen while the timer is still active
@@ -376,7 +377,7 @@ class Node(process):
         self.promises[b][p] = set(acc_log)
         
         # Check for majority
-        majority = (self.cluster_size // 2) + 1
+        majority = (self.live_cluster_size // 2) + 1
         if len(self.promises[b]) >= majority:
             output(f"{self.node_name} got majority promises! Becoming leader.")
             become_leader()
@@ -420,10 +421,10 @@ class Node(process):
         ordered_new_log = sorted(new_log, key=lambda e: e[1])
         nv_msg = ('NEW-VIEW', self.ballot_num, ordered_new_log)
         self.new_view_messages.append(nv_msg)
-        send(nv_msg, to=self.peers)
+        send(nv_msg, to=self.live_peers)
         # Also send ACCEPT to ensure peers record values even if they ignore NEW-VIEW
         for (_, seq, val) in ordered_new_log:
-            send(('ACCEPT', self.ballot_num, seq, val), to=self.peers)
+            send(('ACCEPT', self.ballot_num, seq, val), to=self.live_peers)
             send(('ACCEPTED', self.ballot_num, seq, val, self), to=self)
     
     def receive(msg=('NEW-VIEW', b, new_log), from_=leader):
@@ -484,7 +485,7 @@ class Node(process):
         # Forward to leader if not leader
         if self.status != 'LEADER':
             # Always broadcast to peers to ensure some leader candidate receives it
-            send(('CLIENT_REQUEST', tx, timestamp, cid, req_id, client_proc), to=self.peers)
+            send(('CLIENT_REQUEST', tx, timestamp, cid, req_id, client_proc), to=self.live_peers)
             # If no known leader, kick off election locally
             if self.leader is None:
                 start_election()
@@ -505,7 +506,7 @@ class Node(process):
         val = (tx, timestamp, cid, req_id, client_proc)
         self.accept_log.add((self.ballot_num, seq, val))
         
-        send(('ACCEPT', self.ballot_num, seq, val), to=self.peers)
+        send(('ACCEPT', self.ballot_num, seq, val), to=self.live_peers)
         # Self-vote
         send(('ACCEPTED', self.ballot_num, seq, val, self), to=self)
     
@@ -534,10 +535,10 @@ class Node(process):
         
         self.accepted_votes[key].add(node)
         
-        # Check for majority (need > half of TOTAL cluster, not just current peers)
-        if len(self.accepted_votes[key]) > self.cluster_size / 2:
+        # Check for majority based on live cluster size
+        if len(self.accepted_votes[key]) > self.live_cluster_size / 2:
             # Commit
-            send(('COMMIT', b, seq, val), to=self.peers)
+            send(('COMMIT', b, seq, val), to=self.live_peers)
             output(f"Leader {self.node_name} committing {seq}")
             # Self-commit
             handle_commit(b, seq, val)
@@ -691,7 +692,7 @@ class Node(process):
         if key in self.pending_gap_requests:
             return
         self.pending_gap_requests[key] = time.time()
-        send(('MISSING_REQ', start_seq, end_seq, self), to=self.peers)
+        send(('MISSING_REQ', start_seq, end_seq, self), to=self.live_peers)
 
     def propose_gap_value(seq):
         """Leader proposes a value to fill a gap (reuse any accepted value, else NO-OP)."""
@@ -757,6 +758,11 @@ class Node(process):
             self.known_clients.add(c)
             if c not in self.db:
                 self.db[c] = 10
+
+    def receive(msg=('SET_LIVE', live_set)):
+        # live_set is a set of node processes
+        self.live_peers = set(live_set) - {self}
+        self.live_cluster_size = len(live_set)
     
     def receive(msg=('RESET',)):
         output(f"{self.node_name} RESET. Peers: {len(self.peers)}")
