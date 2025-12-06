@@ -319,8 +319,15 @@ class Node(process):
                 for (b, seq, val) in list(self.accept_log):
                     if b != self.ballot_num:
                         continue
+                    # Skip slots that are already committed/executed to avoid pointless retries
+                    if seq in self.committed_log or seq <= self.last_executed_seq:
+                        continue
                     key = (b, seq)
-                    votes = len(self.accepted_votes.get(key, set()))
+                    voters = self.accepted_votes.setdefault(key, set())
+                    # Ensure the leader always counts its own vote for current-ballot slots
+                    if self not in voters:
+                        voters.add(self)
+                    votes = len(voters)
                     if votes <= self.live_cluster_size / 2:
                         retry_targets.append((seq, val))
                 if retry_targets and self.live_peers:
