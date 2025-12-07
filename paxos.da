@@ -241,11 +241,11 @@ class Driver(process):
                             if live_procs and (wait_misses % 3 == 0):
                                 send(('FORCE_ELECTION',), to=live_procs)
             
-            # Short settle, then print DB
-            time.sleep(TIMEOUT * 0.05)
+            # Short settle so late ACCEPT/COMMITs can propagate before snapshot
+            time.sleep(TIMEOUT * 0.5)
             log_info(f"=== End of Set {test_set['id']} ===")
             send(('PRINT_DB', test_set['id']), to=self.nodes)
-            time.sleep(0.5)
+            time.sleep(TIMEOUT * 0.25)
         
         # Cleanup: tell client and nodes to stop
         send(('DONE',), to=self.client)
