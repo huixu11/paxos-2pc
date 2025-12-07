@@ -327,8 +327,8 @@ class Node(process):
             if self.is_failed:
                 if self.shutdown:
                     break
-                # If STOP set is_failed=True and shutdown=True, break immediately; otherwise wait for recovery
-                await(self.is_failed == False)
+                # Wake up either on recovery or on shutdown so STOP won't hang failed nodes
+                await(self.shutdown or self.is_failed == False)
                 continue
             
             # Leader sends heartbeats and retries pending ACCEPTs that lack majority
@@ -370,7 +370,8 @@ class Node(process):
                     # If shutdown was requested (via STOP), exit promptly
                     if self.shutdown:
                         break
-                    await(self.pause_no_quorum == False and self.is_failed == False)
+                    # Also wake on shutdown so STOP won't hang paused nodes
+                    await(self.shutdown or (self.pause_no_quorum == False and self.is_failed == False))
                     continue
                 old_timer = self.last_leader_msg
                 jitter = random.uniform(0, ELECTION_JITTER)
@@ -386,7 +387,7 @@ class Node(process):
             else:  # CANDIDATE
                 # Wait for any message (ACKs will be processed by receive handler)
                 # Use short timeout to stay responsive
-                if await(self.status != 'CANDIDATE'):
+                if await(self.status != 'CANDIDATE' or self.shutdown):
                     pass  # Became leader or stepped down
                 elif timeout(PREPARE_RETRY_INTERVAL):
                     now = time.time()
