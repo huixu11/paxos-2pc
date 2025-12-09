@@ -238,6 +238,7 @@ class Node(process):
 		self.all_nodes = all_nodes
 		self.cluster_map = {k: set(v) for k, v in cluster_map.items()}
 		self.is_initial_leader = initial_leader
+		self.initial_leader_proc = initial_leader_proc
 
 		self.status = 'LEADER' if initial_leader else 'FOLLOWER'
 		self.ballot_num = (1, node_name, self) if initial_leader else (0, node_name, self)
@@ -545,11 +546,13 @@ class Node(process):
 		if self.is_failed:
 			return
 		if self.status != 'LEADER':
-			if self.current_leader:
-				send(('CLIENT_TX', tx, txid, client), to=self.current_leader)
+			fresh_leader = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
+			if fresh_leader:
+				send(('CLIENT_TX', tx, txid, client), to=fresh_leader)
 				return
 			ensure_leader()
-			return
+			if self.status != 'LEADER':
+				return
 		if len(tx) == 1:
 			cid = tx[0]
 			bal = self.db.get(cid, 10)
@@ -559,6 +562,10 @@ class Node(process):
 		shard_src = shard_for(src)
 		shard_dst = shard_for(dst)
 		if shard_src == self.cluster_id and shard_dst == self.cluster_id:
+			sender_bal = self.db.get(src, 10)
+			if sender_bal < amt:
+				send(('TX_RESULT', txid, 'ABORT'), to=client)
+				return
 			propose(('LOCAL', tx))
 			send(('TX_RESULT', txid, 'COMMIT'), to=client)
 			return
@@ -591,11 +598,13 @@ class Node(process):
 		if self.is_failed:
 			return
 		if self.status != 'LEADER':
-			if self.current_leader:
-				send(('PREPARE_TX', txid, tx, coord_shard), to=self.current_leader)
+			fresh_leader = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
+			if fresh_leader:
+				send(('PREPARE_TX', txid, tx, coord_shard), to=fresh_leader)
 				return
 			ensure_leader()
-			return
+			if self.status != 'LEADER':
+				return
 		src, dst, amt = tx
 		coord_targets = self.cluster_map.get(coord_shard, set())
 		if not acquire_lock(dst, txid):
@@ -629,11 +638,13 @@ class Node(process):
 		if self.is_failed:
 			return
 		if self.status != 'LEADER':
-			if self.current_leader:
-				send(('DECIDE_TX', txid, decision, tx), to=self.current_leader)
+			fresh_leader = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
+			if fresh_leader:
+				send(('DECIDE_TX', txid, decision, tx), to=fresh_leader)
 				return
 			ensure_leader()
-			return
+			if self.status != 'LEADER':
+				return
 		propose(('2PC_APPLY', txid, tx, decision))
 
 	# === Paxos propose ===
@@ -647,10 +658,24 @@ class Node(process):
 	# === Failure and control ===
 	def receive(msg=('FAIL',)):
 		self.is_failed = True
+		for peer in self.live_peers:
+			send(('PEER_FAILED', self), to=peer)
 
 	def receive(msg=('RECOVER',)):
 		self.is_failed = False
 		self.last_leader_msg = time.time()
+		for peer in self.live_peers:
+			send(('PEER_RECOVERED', self), to=peer)
+
+	def receive(msg=('PEER_FAILED', p), from_=_):
+		if p in self.live_peers:
+			self.live_peers.discard(p)
+			self.live_cluster_size = len(self.live_peers) + 1
+
+	def receive(msg=('PEER_RECOVERED', p), from_=_):
+		if p not in self.live_peers and p != self:
+			self.live_peers.add(p)
+			self.live_cluster_size = len(self.live_peers) + 1
 
 	def receive(msg=('RESET',)):
 		self.accept_log = set()
@@ -665,7 +690,7 @@ class Node(process):
 		self.new_view_messages = []
 		self.status = 'LEADER' if self.is_initial_leader else 'FOLLOWER'
 		self.ballot_num = (1, self.node_name, self) if self.is_initial_leader else (0, self.node_name, self)
-		self.leader = self if self.is_initial_leader else None
+		self.leader = self if self.is_initial_leader else self.initial_leader_proc
 		self.current_leader = self.leader
 		self.live_peers = set(self.peers)
 		self.live_cluster_size = len(self.live_peers) + 1
