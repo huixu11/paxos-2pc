@@ -1,0 +1,762 @@
+
+
+import sys
+import time
+import csv
+import random
+import threading
+from da import *  # DistAlgo primitives
+
+# Provide a timeout helper when DA runtime does not supply one in run loop
+def timeout(t: float):
+	time.sleep(t)
+	return True
+
+# === Configuration ===
+TIMEOUT = 3.0            # Base client/driver timeout
+HEARTBEAT_INTERVAL = 0.5
+HEARTBEAT_TIMEOUT = 1.5
+ELECTION_TIMEOUT = 5.0   # Keep elections responsive
+PREPARE_BACKOFF = 1.0
+PREPARE_RETRY_INTERVAL = 1.0
+MAX_CANDIDATE_TIME = 2 * ELECTION_TIMEOUT
+ELECTION_JITTER = 0.5
+
+VERBOSE_LOG = False
+
+
+# === Logging Helpers ===
+def _emit(msg:str):
+	try:
+		output(msg)
+	except Exception:
+		print(msg)
+
+
+def log_debug(msg:str):
+	if VERBOSE_LOG:
+		_emit(msg)
+
+
+def log_info(msg:str):
+	_emit(msg)
+
+
+# === Helpers ===
+def parse_transaction(tx_str):
+	if not tx_str or tx_str.strip() == "":
+		return None
+	# Ignore failure/recovery markers that live in the tx column
+	if tx_str.strip().startswith('F(') or tx_str.strip().startswith('R('):
+		return None
+	tx_str = tx_str.strip().strip('()')
+	parts = [p.strip() for p in tx_str.split(',')]
+	if len(parts) == 3:
+		try:
+			return (int(parts[0]), int(parts[1]), int(parts[2]))
+		except Exception:
+			return None
+	if len(parts) == 1:
+		try:
+			return (int(parts[0]),)
+		except Exception:
+			return None
+	return None
+
+
+def parse_live_nodes(nodes_str):
+	if not nodes_str or nodes_str.strip() == "":
+		return []
+	nodes_str = nodes_str.strip().strip('[]')
+	return [n.strip() for n in nodes_str.split(',') if n.strip()]
+
+
+def shard_for(key:int):
+	if key < 3000:
+		return 1
+	if key < 6000:
+		return 2
+	return 3
+
+
+# === Parsing ===
+def read_tests(csv_file):
+	test_sets = []
+	current = None
+	with open(csv_file, 'r') as f:
+		reader = csv.reader(f)
+		next(reader, None)
+		for row in reader:
+			if not row or len(row) < 2:
+				continue
+			set_num = row[0].strip()
+			tx_str = row[1].strip()
+			live_nodes_str = row[2].strip() if len(row) > 2 else ''
+
+			if set_num:
+				if current:
+					test_sets.append(current)
+				current = {'id': set_num, 'transactions': [], 'live_nodes': parse_live_nodes(live_nodes_str)}
+
+			if not current:
+				continue
+
+			if tx_str:
+				if tx_str.startswith('F(') and tx_str.endswith(')'):
+					current['transactions'].append(('FAIL', tx_str[2:-1]))
+				elif tx_str.startswith('R(') and tx_str.endswith(')'):
+					current['transactions'].append(('RECOVER', tx_str[2:-1]))
+				else:
+					tx = parse_transaction(tx_str)
+					if tx:
+						current['transactions'].append(('TX', tx))
+
+		if current:
+			test_sets.append(current)
+	return test_sets
+
+
+# === Driver ===
+
+class Driver(process):
+	def setup(csv_path:str, node_map:dict, clusters:dict, cluster_leaders:dict):
+		self.test_sets = read_tests(csv_path)
+		self.node_map = node_map
+		self.clusters = clusters
+		self.cluster_leaders = cluster_leaders
+		self.proc_to_name = {proc: name for name, proc in node_map.items()}
+		self.cluster_name_map = {cid: {self.proc_to_name.get(p, str(p)) for p in procs} for cid, procs in clusters.items()}
+		self.pending = {}
+		self.stats = {}
+		self.all_nodes = set(node_map.values())
+
+	def run():
+		for set_info in self.test_sets:
+			set_id = set_info['id']
+			txs = set_info['transactions']
+			live_nodes = set(set_info['live_nodes']) if set_info['live_nodes'] else set(self.node_map.keys())
+
+			# Flush state
+			send(('RESET',), to=list(self.all_nodes))
+			time.sleep(TIMEOUT * 0.2)
+
+			# Apply live set
+			for name, proc in self.node_map.items():
+				if name in live_nodes:
+					send(('RECOVER',), to=proc)
+				else:
+					send(('FAIL',), to=proc)
+
+			time.sleep(TIMEOUT * 0.2)
+
+			# Run transactions sequentially
+			total = 0
+			lat_sum = 0.0
+			set_start = time.time()
+
+			for idx, (kind, payload) in enumerate(txs, start=1):
+				if kind == 'FAIL':
+					if payload in self.node_map:
+						send(('FAIL',), to=self.node_map[payload])
+						live_nodes.discard(payload)
+					continue
+				if kind == 'RECOVER':
+					if payload in self.node_map:
+						send(('RECOVER',), to=self.node_map[payload])
+						live_nodes.add(payload)
+					continue
+				if kind != 'TX':
+					continue
+
+				tx = payload
+				txid = (int(set_id), idx)
+
+				# Pick cluster leader target
+				shard = shard_for(tx[0]) if len(tx) >= 1 else 1
+				leader_proc = self.cluster_leaders.get(shard)
+				leader_name = self.proc_to_name.get(leader_proc)
+				leader_target = None
+				if leader_name and leader_name in live_nodes:
+					leader_target = leader_proc
+				else:
+					shard_procs = self.clusters.get(shard, set())
+					live_candidates = [p for p in shard_procs if self.proc_to_name.get(p) in live_nodes]
+					if live_candidates:
+						leader_target = live_candidates[0]
+				if not leader_target:
+					leader_target = leader_proc
+				if not leader_target:
+					log_info(f"No leader target for shard {shard}, skipping {tx}")
+					continue
+
+				start_ts = time.time()
+				send(('CLIENT_TX', tx, txid, self), to=leader_target)
+
+				res = None
+				deadline = start_ts + TIMEOUT
+				while time.time() < deadline:
+					if txid in self.pending:
+						res = self.pending.pop(txid)
+						break
+					await(timeout(0.05))
+				if res is None and txid in self.pending:
+					res = self.pending.pop(txid)
+				if res is not None:
+					lat_sum += (time.time() - start_ts)
+					total += 1
+					log_info(f"Set {set_id} tx {tx} -> {res}")
+				else:
+					log_info(f"Set {set_id} tx {tx} timed out")
+
+			elapsed = max(time.time() - set_start, 1e-6)
+			throughput = total / elapsed
+			avg_lat = (lat_sum / total) if total else 0.0
+			log_info(f"Set {set_id} throughput={throughput:.2f} tx/s avg_lat={avg_lat:.3f}s count={total}")
+			self.stats[set_id] = {'throughput': throughput, 'avg_lat': avg_lat, 'count': total}
+
+			send(('PRINT_DB', set_id), to=list(self.all_nodes))
+			send(('PRINT_VIEW', set_id), to=list(self.all_nodes))
+			time.sleep(TIMEOUT * 0.2)
+
+		send(('STOP',), to=list(self.all_nodes))
+
+	def receive(msg=('TX_RESULT', req_id, result)):
+		self.pending[req_id] = result
+
+	def receive(msg=('PRINT_PERF',)):
+		for sid, stat in self.stats.items():
+			output(f"Set {sid} throughput={stat['throughput']:.2f} avg_lat={stat['avg_lat']:.3f}s count={stat['count']}")
+
+
+# === Node ===
+
+class Node(process):
+	def setup(node_name:str, cluster_id:int, peers:set, all_nodes:set, cluster_map:dict, initial_leader:bool, initial_leader_proc):
+		self.node_name = node_name
+		self.cluster_id = cluster_id
+		self.peers = peers - {self}
+		self.all_nodes = all_nodes
+		self.cluster_map = {k: set(v) for k, v in cluster_map.items()}
+		self.is_initial_leader = initial_leader
+
+		self.status = 'LEADER' if initial_leader else 'FOLLOWER'
+		self.ballot_num = (1, node_name, self) if initial_leader else (0, node_name, self)
+		self.leader = self if initial_leader else initial_leader_proc
+		self.current_leader = self.leader
+		self.accept_log = set()
+		self.committed_log = {}
+		self.accepted_votes = {}
+		self.promises = {}
+		self.next_seq = 1
+		self.last_executed = 0
+
+		self.last_leader_msg = time.time()
+		self.buffered_prepare = None
+		self.last_prepare_received_time = 0.0
+		self.last_election_time = 0.0
+		self.candidate_start_time = 0.0
+		self.leader_grace_until = 0.0
+		self.live_peers = set(self.peers)
+		self.live_cluster_size = len(self.live_peers) + 1
+
+		self.db = {}
+		self.client_replies = {}
+		self.pending_requests = set()
+		self.sent_replies = set()
+		self.locks = {}
+		self.tx_table = {}
+
+		self.new_view_messages = []
+
+		self.is_failed = False
+		self.shutdown = False
+
+	# === Run loop ===
+	def run():
+		while not self.shutdown:
+			if self.is_failed:
+				await(self.is_failed == False or self.shutdown)
+				continue
+
+			if self.status == 'LEADER' and self.live_peers:
+				send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
+				await(timeout(HEARTBEAT_INTERVAL))
+			elif self.status == 'FOLLOWER':
+				old = self.last_leader_msg
+				jitter = random.uniform(0, ELECTION_JITTER)
+				to_wait = (ELECTION_TIMEOUT + jitter) - (time.time() - old)
+				if to_wait < 0:
+					to_wait = 0
+				if await(self.last_leader_msg > old):
+					pass
+				elif timeout(to_wait):
+					handle_timer_expiry()
+			else:  # CANDIDATE
+				if await(self.status != 'CANDIDATE' or self.shutdown):
+					pass
+				elif timeout(PREPARE_RETRY_INTERVAL):
+					now = time.time()
+					if self.candidate_start_time and (now - self.candidate_start_time) >= MAX_CANDIDATE_TIME:
+						self.status = 'FOLLOWER'
+						self.last_leader_msg = now
+					elif self.live_peers:
+						send(('PREPARE', self.ballot_num), to=self.live_peers)
+						self.last_leader_msg = now
+
+	# === Heartbeats & Election ===
+	def handle_timer_expiry():
+		if self.status != 'FOLLOWER' or self.is_failed:
+			return
+		if (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT:
+			return
+		now = time.time()
+		if (now - self.last_prepare_received_time) < PREPARE_BACKOFF:
+			return
+		start_election()
+
+	def should_i_lead():
+		live_names = [getattr(p, 'node_name', str(p)) for p in self.live_peers] + [self.node_name]
+		return self.node_name == min(live_names)
+
+	def start_election():
+		if self.is_failed or self.status == 'CANDIDATE' or self.status == 'LEADER':
+			return
+		if not should_i_lead():
+			self.last_leader_msg = time.time()
+			return
+		self.status = 'CANDIDATE'
+		self.ballot_num = (self.ballot_num[0] + 1, self.node_name, self)
+		key = (self.ballot_num[0], self.ballot_num[1])
+		self.promises[key] = {self: set(self.accept_log)}
+		self.last_election_time = time.time()
+		self.candidate_start_time = time.time()
+		self.last_leader_msg = time.time()
+		if self.live_peers:
+			send(('PREPARE', self.ballot_num), to=self.live_peers)
+
+# Conservative helper: follow known leader; if none, trigger election
+	def ensure_leader():
+		if self.status == 'LEADER':
+			return True
+		if self.current_leader and self.current_leader != self:
+			return False
+		start_election()
+		return False
+
+	def become_leader():
+		self.status = 'LEADER'
+		self.leader = self
+		self.current_leader = self
+		self.leader_grace_until = time.time() + ELECTION_TIMEOUT
+		self.live_cluster_size = len(self.live_peers) + 1
+		key = (self.ballot_num[0], self.ballot_num[1])
+		for acc_log in self.promises.get(key, {}).values():
+			self.accept_log.update(acc_log)
+		self.new_view_messages.append(('NEW-VIEW', self.ballot_num, len(self.accept_log)))
+		if self.live_peers:
+			send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
+
+	# === Paxos message handlers ===
+	def receive(msg=('HEARTBEAT', b, leader_proc), from_=p):
+		if self.is_failed:
+			return
+		if leader_proc == self.current_leader or b >= self.ballot_num:
+			if b > self.ballot_num:
+				self.ballot_num = b
+			self.status = 'FOLLOWER'
+			self.leader = leader_proc
+			self.current_leader = leader_proc
+			self.last_leader_msg = time.time()
+
+	def receive(msg=('PREPARE', b), from_=p):
+		if self.is_failed:
+			return
+		now = time.time()
+		self.last_prepare_received_time = now
+		if self.status == 'LEADER' and now < self.leader_grace_until:
+			return
+		if b >= self.ballot_num:
+			accept_prepare(b, p)
+			return
+		if self.buffered_prepare is None or b > self.buffered_prepare[0]:
+			self.buffered_prepare = (b, p)
+
+	def accept_prepare(b, proposer):
+		self.ballot_num = b
+		self.status = 'FOLLOWER'
+		self.leader = proposer
+		self.current_leader = proposer
+		self.candidate_start_time = 0.0
+		self.buffered_prepare = None
+		self.last_leader_msg = time.time()
+		serialized_log = []
+		for (ballot, seq, val) in self.accept_log:
+			ballot_key = (ballot[0], ballot[1]) if isinstance(ballot, tuple) and len(ballot) >= 2 else ballot
+			serialized_log.append((ballot_key, seq, val))
+		b_key = (b[0], b[1]) if isinstance(b, tuple) and len(b) >= 2 else b
+		send(('ACK', b_key, serialized_log), to=proposer)
+
+	def receive(msg=('ACK', b, acc_log), from_=p):
+		b_key = (b[0], b[1]) if len(b) >= 2 else b
+		my_key = (self.ballot_num[0], self.ballot_num[1]) if len(self.ballot_num) >= 2 else self.ballot_num
+		if isinstance(acc_log, list):
+			acc_log = set(acc_log)
+		if self.is_failed:
+			return
+		if self.status != 'CANDIDATE':
+			if b_key != my_key:
+				send(('PREPARE', self.ballot_num), to=p)
+			return
+		if b_key != my_key:
+			send(('PREPARE', self.ballot_num), to=p)
+			return
+		if b_key not in self.promises:
+			self.promises[b_key] = {}
+		self.promises[b_key][p] = set(acc_log)
+		majority = (self.live_cluster_size // 2) + 1
+		if len(self.promises[b_key]) >= majority:
+			become_leader()
+
+	def receive(msg=('ACCEPT', b, seq, val), from_=leader):
+		if self.is_failed:
+			return
+		if b < self.ballot_num:
+			send(('NACK', (self.ballot_num[0], self.ballot_num[1])), to=leader)
+			return
+		self.ballot_num = b
+		self.status = 'FOLLOWER'
+		self.leader = leader
+		self.current_leader = leader
+		self.last_leader_msg = time.time()
+		self.accept_log.add((b, seq, val))
+		send(('ACCEPTED', b, seq, val, self), to=leader)
+
+	def receive(msg=('NACK', b_key), from_=p):
+		if self.status != 'LEADER':
+			return
+		my_key = (self.ballot_num[0], self.ballot_num[1])
+		if b_key > my_key:
+			self.status = 'FOLLOWER'
+			self.last_leader_msg = time.time()
+
+	def receive(msg=('ACCEPTED', b, seq, val, node), from_=_):
+		if self.is_failed or self.status != 'LEADER':
+			return
+		key = (b, seq)
+		voters = self.accepted_votes.setdefault(key, set())
+		voters.add(node)
+		if self not in voters:
+			voters.add(self)
+		if len(voters) > self.live_cluster_size / 2:
+			if seq not in self.committed_log:
+				handle_commit(b, seq, val)
+				send(('COMMIT', b, seq, val), to=self.live_peers)
+
+	def receive(msg=('COMMIT', b, seq, val), from_=_):
+		handle_commit(b, seq, val)
+
+	def handle_commit(b, seq, val):
+		if seq in self.committed_log:
+			return
+		self.committed_log[seq] = val
+		if seq > self.next_seq:
+			self.next_seq = seq + 1
+		execute_committed()
+
+	def execute_committed():
+		while self.last_executed + 1 in self.committed_log:
+			seq = self.last_executed + 1
+			val = self.committed_log[seq]
+			apply_entry(val)
+			self.last_executed = seq
+
+	# === Application logic ===
+	def apply_entry(val):
+		tag = val[0] if isinstance(val, tuple) else None
+		if tag == 'LOCAL':
+			_, tx = val
+			apply_local(tx)
+		elif tag == '2PC_BEGIN':
+			_, txid, tx, participants, client = val
+			participants = tuple(participants)
+			self.tx_table[txid] = {'state': 'PREPARING', 'tx': tx, 'participants': participants, 'client': client, 'votes': {}}
+			for shard in participants:
+				targets = self.cluster_map.get(shard, set())
+				send(('PREPARE_TX', txid, tx, self.cluster_id), to=targets)
+		elif tag == '2PC_VOTE':
+			_, txid, vote = val
+			meta = self.tx_table.get(txid, {'state': 'VOTED'})
+			meta['state'] = 'VOTED'
+			meta['vote'] = vote
+			self.tx_table[txid] = meta
+		elif tag == '2PC_DECIDE':
+			_, txid, decision = val
+			meta = self.tx_table.get(txid, {})
+			meta['decision'] = decision
+			meta['state'] = 'DECIDED'
+			self.tx_table[txid] = meta
+			tx = meta.get('tx')
+			participants = tuple(meta.get('participants', ()))
+			for shard in participants:
+				targets = self.cluster_map.get(shard, set())
+				send(('DECIDE_TX', txid, decision, tx), to=targets)
+			client = meta.get('client')
+			if client:
+				send(('TX_RESULT', txid, decision), to=client)
+			if tx:
+				propose(('2PC_APPLY', txid, tx, decision))
+		elif tag == '2PC_APPLY':
+			_, txid, tx, decision = val
+			if decision == 'COMMIT':
+				apply_commit(tx)
+			cleanup_tx(txid)
+		elif tag == 'NO-OP':
+			pass
+
+	def apply_local(tx):
+		src, dst, amt = tx
+		if src not in self.db:
+			self.db[src] = 10
+		if dst not in self.db:
+			self.db[dst] = 10
+		if self.db[src] < amt:
+			return
+		self.db[src] -= amt
+		self.db[dst] += amt
+
+	def apply_commit(tx):
+		src, dst, amt = tx
+		if src not in self.db:
+			self.db[src] = 10
+		if dst not in self.db:
+			self.db[dst] = 10
+		if shard_for(src) == self.cluster_id:
+			self.db[src] -= amt
+		if shard_for(dst) == self.cluster_id:
+			self.db[dst] += amt
+
+	def cleanup_tx(txid):
+		release_locks(txid)
+		if txid in self.tx_table:
+			del self.tx_table[txid]
+
+	# === 2PC Handlers ===
+	def receive(msg=('CLIENT_TX', tx, txid, client), from_=sender):
+		if self.is_failed:
+			return
+		if self.status != 'LEADER':
+			if self.current_leader:
+				send(('CLIENT_TX', tx, txid, client), to=self.current_leader)
+				return
+			ensure_leader()
+			return
+		if len(tx) == 1:
+			cid = tx[0]
+			bal = self.db.get(cid, 10)
+			send(('TX_RESULT', txid, ('BAL', bal)), to=client)
+			return
+		src, dst, amt = tx
+		shard_src = shard_for(src)
+		shard_dst = shard_for(dst)
+		if shard_src == self.cluster_id and shard_dst == self.cluster_id:
+			propose(('LOCAL', tx))
+			send(('TX_RESULT', txid, 'COMMIT'), to=client)
+			return
+		participants = (shard_dst,)
+		if not acquire_lock(src, txid):
+			send(('TX_RESULT', txid, 'ABORT'), to=client)
+			return
+		sender_bal = self.db.get(src, 10)
+		if sender_bal < amt:
+			release_locks(txid)
+			send(('TX_RESULT', txid, 'ABORT'), to=client)
+			return
+		propose(('2PC_BEGIN', txid, tx, participants, client))
+
+	def acquire_lock(key, txid):
+		holder = self.locks.get(key)
+		if holder and holder != txid:
+			return False
+		self.locks[key] = txid
+		if key not in self.db:
+			self.db[key] = 10
+		return True
+
+	def release_locks(txid):
+		for k, v in list(self.locks.items()):
+			if v == txid:
+				del self.locks[k]
+
+	def receive(msg=('PREPARE_TX', txid, tx, coord_shard), from_=leader):
+		if self.is_failed:
+			return
+		if self.status != 'LEADER':
+			if self.current_leader:
+				send(('PREPARE_TX', txid, tx, coord_shard), to=self.current_leader)
+				return
+			ensure_leader()
+			return
+		src, dst, amt = tx
+		coord_targets = self.cluster_map.get(coord_shard, set())
+		if not acquire_lock(dst, txid):
+			propose(('2PC_VOTE', txid, 'ABORT'))
+			send(('VOTE', txid, 'ABORT'), to=coord_targets)
+			return
+		propose(('2PC_VOTE', txid, 'COMMIT'))
+		send(('VOTE', txid, 'COMMIT'), to=coord_targets)
+
+	def receive(msg=('VOTE', txid, vote), from_=p):
+		meta = self.tx_table.get(txid)
+		if not meta or meta.get('state') != 'PREPARING':
+			return
+		vote_shard = None
+		for sid, members in self.cluster_map.items():
+			if p in members:
+				vote_shard = sid
+				break
+		if vote_shard is None:
+			return
+		if vote_shard in meta['votes']:
+			return
+		meta['votes'][vote_shard] = vote
+		self.tx_table[txid] = meta
+		if all(v == 'COMMIT' for v in meta['votes'].values()) and len(meta['votes']) == len(meta['participants']):
+			propose(('2PC_DECIDE', txid, 'COMMIT'))
+		elif any(v == 'ABORT' for v in meta['votes'].values()):
+			propose(('2PC_DECIDE', txid, 'ABORT'))
+
+	def receive(msg=('DECIDE_TX', txid, decision, tx), from_=coord):
+		if self.is_failed:
+			return
+		if self.status != 'LEADER':
+			if self.current_leader:
+				send(('DECIDE_TX', txid, decision, tx), to=self.current_leader)
+				return
+			ensure_leader()
+			return
+		propose(('2PC_APPLY', txid, tx, decision))
+
+	# === Paxos propose ===
+	def propose(val):
+		seq = self.next_seq
+		self.next_seq += 1
+		self.accept_log.add((self.ballot_num, seq, val))
+		send(('ACCEPT', self.ballot_num, seq, val), to=self.live_peers)
+		send(('ACCEPTED', self.ballot_num, seq, val, self), to=self)
+
+	# === Failure and control ===
+	def receive(msg=('FAIL',)):
+		self.is_failed = True
+
+	def receive(msg=('RECOVER',)):
+		self.is_failed = False
+		self.last_leader_msg = time.time()
+
+	def receive(msg=('RESET',)):
+		self.accept_log = set()
+		self.committed_log = {}
+		self.accepted_votes = {}
+		self.promises = {}
+		self.next_seq = 1
+		self.last_executed = 0
+		self.db = {}
+		self.locks = {}
+		self.tx_table = {}
+		self.new_view_messages = []
+		self.status = 'LEADER' if self.is_initial_leader else 'FOLLOWER'
+		self.ballot_num = (1, self.node_name, self) if self.is_initial_leader else (0, self.node_name, self)
+		self.leader = self if self.is_initial_leader else None
+		self.current_leader = self.leader
+		self.live_peers = set(self.peers)
+		self.live_cluster_size = len(self.live_peers) + 1
+		self.last_leader_msg = time.time()
+
+	def receive(msg=('PRINT_DB', set_id)):
+		changed = ", ".join([f"{k}:{v}" for k, v in sorted(self.db.items())])
+		output(f"Set {set_id} {self.node_name} DB: {changed}")
+
+	def receive(msg=('PRINT_VIEW', set_id)):
+		for nv in self.new_view_messages:
+			output(f"Set {set_id} {self.node_name} View: {nv}")
+
+	def receive(msg=('PRINT_BALANCE', key_id)):
+		bal = self.db.get(key_id, 10)
+		output(f"{self.node_name}: {bal}")
+
+	def receive(msg=('PRINT_RESHARD',)):
+		output(f"{self.node_name} RESHARD: []")
+
+	def receive(msg=('STOP',)):
+		self.shutdown = True
+
+
+# === Parsing ===
+def read_tests(csv_file):
+	test_sets = []
+	current = None
+	with open(csv_file, 'r') as f:
+		reader = csv.reader(f)
+		next(reader, None)
+		for row in reader:
+			if not row or len(row) < 2:
+				continue
+			set_num = row[0].strip()
+			tx_str = row[1].strip()
+			live_nodes_str = row[2].strip() if len(row) > 2 else ''
+
+			if set_num:
+				if current:
+					test_sets.append(current)
+				current = {'id': set_num, 'transactions': [], 'live_nodes': parse_live_nodes(live_nodes_str)}
+
+			if not current:
+				continue
+
+			if tx_str:
+				if tx_str.startswith('F(') and tx_str.endswith(')'):
+					current['transactions'].append(('FAIL', tx_str[2:-1]))
+				elif tx_str.startswith('R(') and tx_str.endswith(')'):
+					current['transactions'].append(('RECOVER', tx_str[2:-1]))
+				else:
+					tx = parse_transaction(tx_str)
+					if tx:
+						current['transactions'].append(('TX', tx))
+
+		if current:
+			test_sets.append(current)
+	return test_sets
+
+
+def main():
+	csv_arg = sys.argv[1] if len(sys.argv) > 1 else 'CSE535-F25-Project-3-Testcases.csv'
+	log_info(f"Using test file: {csv_arg}")
+
+	node_names = ['n1','n2','n3','n4','n5','n6','n7','n8','n9']
+	nodes = new(Node, num=9)
+	nodes_list = list(nodes)
+
+	node_map = {name: proc for name, proc in zip(node_names, nodes_list)}
+	cluster_map = {
+		1: set(nodes_list[0:3]),
+		2: set(nodes_list[3:6]),
+		3: set(nodes_list[6:9])
+	}
+	leader_lookup = {'n1': node_map['n1'], 'n4': node_map['n4'], 'n7': node_map['n7']}
+	cluster_leaders = {1: leader_lookup['n1'], 2: leader_lookup['n4'], 3: leader_lookup['n7']}
+
+	for i, node in enumerate(nodes_list):
+		name = node_names[i]
+		cid = 1 if i < 3 else (2 if i < 6 else 3)
+		peers = cluster_map[cid]
+		initial_leader = name in ['n1', 'n4', 'n7']
+		initial_leader_proc = leader_lookup['n1'] if cid == 1 else (leader_lookup['n4'] if cid == 2 else leader_lookup['n7'])
+		setup(node, (name, cid, peers, set(nodes_list), cluster_map, initial_leader, initial_leader_proc))
+
+	start(nodes)
+
+	driver = new(Driver, num=1)
+	setup(driver, (csv_arg, node_map, cluster_map, cluster_leaders))
+	start(driver)
+
+	# Main returns; runtime will join child processes
+
