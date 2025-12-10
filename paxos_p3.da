@@ -299,9 +299,9 @@ class Node(process):
 							send(('DECISION', txid, desc), to=targets)
 							self.decision_outbox[txid]['last_sent'] = now
 				for txid, meta in list(self.pending_2pc.items()):
-					if now - meta.get('ts', now) > TIMEOUT * 2 and txid in self.tx_meta:
+					if now - meta.get('ts', now) > TIMEOUT and txid in self.tx_meta:
 						decision = 'ABORT'
-						seq_c = self.tx_meta[txid].get('commit_seq', self.next_seq)
+						seq_c = self.tx_meta[txid].get('commit_seq', self.tx_meta[txid].get('prepare_seq', self.next_seq))
 						propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
 						for shard in self.tx_meta[txid].get('participants', ()): 
 							targets = self.cluster_map.get(shard, set())
@@ -359,6 +359,10 @@ class Node(process):
 		self.last_election_time = time.time()
 		self.candidate_start_time = time.time()
 		self.last_leader_msg = time.time()
+		if not self.live_peers:
+			# Single live node: self-elect immediately so progress continues.
+			become_leader()
+			return
 		if self.live_peers:
 			send(('PREPARE', self.ballot_num), to=self.live_peers)
 
@@ -488,7 +492,10 @@ class Node(process):
 		if self not in voters:
 			voters.add(self)
 		if len(voters) > self.live_cluster_size / 2:
-			if seq not in self.committed_log:
+			existing = self.committed_log.get(seq)
+			if existing and is_prep(existing) and is_decision(val):
+				handle_commit(b, seq, val)
+			elif not existing:
 				handle_commit(b, seq, val)
 				send(('COMMIT', b, seq, val), to=self.live_peers)
 
@@ -496,7 +503,13 @@ class Node(process):
 		handle_commit(b, seq, val)
 
 	def handle_commit(b, seq, val):
-		if seq in self.committed_log:
+		existing = self.committed_log.get(seq)
+		if existing:
+			if is_prep(existing) and is_decision(val):
+				# Apply the decision even if a prepare already committed at this slot.
+				self.committed_log[seq] = val
+				_, txid, decision, role = val
+				apply_decision_entry(txid, decision, role)
 			return
 		self.committed_log[seq] = val
 		if seq > self.next_seq:
@@ -511,6 +524,14 @@ class Node(process):
 			self.last_executed = seq
 
 	# === Application logic ===
+	def is_prep(val):
+		tag = val[0] if isinstance(val, tuple) else None
+		return tag in ('2PC_PREP', '2PC_PREP_ABORT')
+
+	def is_decision(val):
+		tag = val[0] if isinstance(val, tuple) else None
+		return tag == '2PC_DECISION'
+
 	def apply_entry(val):
 		tag = val[0] if isinstance(val, tuple) else None
 		if tag == 'LOCAL':
@@ -559,7 +580,7 @@ class Node(process):
 					send(('PREPARED', txid), to=targets)
 		if role == 'COORD' and self.status == 'LEADER' and meta['prepared'].get('PART') and not meta.get('decision'):
 			decision = 'COMMIT'
-			seq_c = meta.get('commit_seq', self.next_seq)
+			seq_c = meta.get('commit_seq', meta.get('prepare_seq', self.next_seq))
 			propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
 			for shard in meta.get('participants', ()): 
 				targets = self.cluster_map.get(shard, set())
@@ -633,13 +654,12 @@ class Node(process):
 			send(('TX_RESULT', txid, 'ABORT'), to=client)
 			return
 		seq_p = self.next_seq
-		seq_c = seq_p + 1
-		self.tx_meta[txid] = {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': seq_p, 'commit_seq': seq_c, 'client': client, 'participants': participants, 'ts': time.time()}
+		self.tx_meta[txid] = {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': seq_p, 'commit_seq': seq_p, 'client': client, 'participants': participants, 'ts': time.time()}
 		self.tx_client[txid] = client
 		propose_with_seq(seq_p, ('2PC_PREP', txid, tx, 'COORD'))
 		targets = self.cluster_map.get(shard_dst, set())
-		send(('PREPARE_TX', txid, tx, self.cluster_id, seq_p, seq_c), to=targets)
-		self.pending_2pc[txid] = {'state': 'WAIT_PREPARED', 'ts': time.time(), 'seq_p': seq_p, 'seq_c': seq_c}
+		send(('PREPARE_TX', txid, tx, self.cluster_id, seq_p, seq_p), to=targets)
+		self.pending_2pc[txid] = {'state': 'WAIT_PREPARED', 'ts': time.time(), 'seq_p': seq_p}
 
 	def acquire_lock(key, txid):
 		holder = self.locks.get(key)
@@ -682,7 +702,7 @@ class Node(process):
 			propose_with_seq(seq_p, ('2PC_PREP_ABORT', txid, tx, 'PART'))
 			send(('ABORT_TX', txid), to=coord_targets)
 			return
-		self.tx_meta[txid] = {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': seq_p, 'commit_seq': seq_c, 'client': None, 'participants': (self.cluster_id,), 'ts': time.time(), 'coord_shard': coord_shard}
+		self.tx_meta[txid] = {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': seq_p, 'commit_seq': seq_p, 'client': None, 'participants': (self.cluster_id,), 'ts': time.time(), 'coord_shard': coord_shard}
 		propose_with_seq(seq_p, ('2PC_PREP', txid, tx, 'PART'))
 
 	def receive(msg=('PREPARED', txid), from_=p):
@@ -702,7 +722,7 @@ class Node(process):
 			return
 		if meta['prepared'].get('COORD') and not meta.get('decision'):
 			decision = 'COMMIT'
-			seq_c = meta.get('commit_seq', self.next_seq)
+			seq_c = meta.get('commit_seq', meta.get('prepare_seq', self.next_seq))
 			propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
 			participant_shards = meta.get('participants', ())
 			for shard in participant_shards:
@@ -722,7 +742,7 @@ class Node(process):
 				ensure_leader()
 			return
 		decision = 'ABORT'
-		seq_c = meta.get('commit_seq', self.next_seq)
+		seq_c = meta.get('commit_seq', meta.get('prepare_seq', self.next_seq))
 		propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
 		participant_shards = meta.get('participants', ())
 		for shard in participant_shards:
@@ -744,7 +764,7 @@ class Node(process):
 				self.backlog_decisions.append((txid, decision))
 				ensure_leader()
 			return
-		seq_c = meta.get('commit_seq', self.next_seq)
+		seq_c = meta.get('commit_seq', meta.get('prepare_seq', self.next_seq))
 		propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'PART'))
 		send(('DECISION_ACK', txid), to=coord)
 
