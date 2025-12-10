@@ -288,6 +288,10 @@ class Node(process):
 				continue
 
 			if self.status == 'LEADER':
+				# Process any buffered client requests now that we lead.
+				for txid, tx, client in list(self.pending_requests):
+					handle_client_tx(tx, txid, client)
+					self.pending_requests.discard((txid, tx, client))
 				if self.live_peers:
 					send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
 				await(timeout(HEARTBEAT_INTERVAL))
@@ -649,11 +653,19 @@ class Node(process):
 				return
 			ensure_leader()
 			if self.status != 'LEADER':
+				self.pending_requests.add((txid, tx, client))
 				return
+		handle_client_tx(tx, txid, client)
+
+	def handle_client_tx(tx, txid, client):
+		# Skip if we already processed this request
+		if txid in self.tx_client:
+			return
 		if len(tx) == 1:
 			cid = tx[0]
 			bal = self.db.get(cid, 10)
 			send(('TX_RESULT', txid, ('BAL', bal)), to=client)
+			self.tx_client[txid] = client
 			return
 		src, dst, amt = tx
 		shard_src = shard_for(src)
@@ -662,18 +674,22 @@ class Node(process):
 			sender_bal = self.db.get(src, 10)
 			if sender_bal < amt:
 				send(('TX_RESULT', txid, 'ABORT'), to=client)
+				self.tx_client[txid] = client
 				return
 			propose(('LOCAL', tx))
 			send(('TX_RESULT', txid, 'COMMIT'), to=client)
+			self.tx_client[txid] = client
 			return
 		participants = (shard_dst,)
 		if not acquire_lock(src, txid):
 			send(('TX_RESULT', txid, 'ABORT'), to=client)
+			self.tx_client[txid] = client
 			return
 		sender_bal = self.db.get(src, 10)
 		if sender_bal < amt:
 			release_locks(txid)
 			send(('TX_RESULT', txid, 'ABORT'), to=client)
+			self.tx_client[txid] = client
 			return
 		seq_p = self.next_seq
 		self.tx_meta[txid] = {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': seq_p, 'commit_seq': seq_p, 'client': client, 'participants': participants, 'ts': time.time()}
