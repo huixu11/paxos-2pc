@@ -370,7 +370,7 @@ class Node(process):
 					self.pending_requests.discard((txid, tx, client))
 				if self.live_peers:
 					send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
-				await(timeout(HEARTBEAT_INTERVAL))
+				await(timeout(HEARTBEAT_INTERVAL * 0.75))
 				# Resend outstanding 2PC decisions if needed
 				now = time.time()
 				for txid, info in list(self.decision_outbox.items()):
@@ -835,11 +835,13 @@ class Node(process):
 		self.tx_meta[txid] = meta
 		if txid in self.pending_2pc:
 			self.pending_2pc[txid].setdefault('participants_ready', set()).add(meta.get('participants', ())[0])
+		coord_shard = meta.get('coord_shard')
+		coord_targets = self.cluster_map.get(coord_shard, set()) if coord_shard else set()
+		if coord_targets:
+			send(('PREPARED', txid), to=coord_targets)
 		if self.status != 'LEADER':
 			fresh = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
-			if fresh:
-				send(('PREPARED', txid), to=fresh)
-			else:
+			if not fresh:
 				self.backlog_prepared.add(txid)
 				ensure_leader()
 			return
@@ -858,10 +860,11 @@ class Node(process):
 		if not meta:
 			return
 		if self.status != 'LEADER':
+			coord_targets = self.cluster_map.get(meta.get('coord_shard'), set()) if meta else set()
+			if coord_targets:
+				send(('ABORT_TX', txid), to=coord_targets)
 			fresh = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
-			if fresh:
-				send(('ABORT_TX', txid), to=fresh)
-			else:
+			if not fresh:
 				self.backlog_decisions.append((txid, 'ABORT'))
 				ensure_leader()
 			return
