@@ -204,7 +204,12 @@ class Driver(process):
 		self.cluster_name_map = {cid: {self.proc_to_name.get(p, str(p)) for p in procs} for cid, procs in clusters.items()}
 		self.pending = {}
 		self.stats = {}
+		self.balance_responses = {}
 		self.all_nodes = set(node_map.values())
+		self.prompt_sets = os.environ.get('PROMPT_SETS', '').lower() not in ('', '0', 'false', 'no')
+		self.prompt_balance = os.environ.get('PROMPT_BALANCE', '').lower() not in ('', '0', 'false', 'no')
+		skip_env = os.environ.get('SKIP_SETS', '')
+		self.skip_sets = {s.strip() for s in skip_env.split(',') if s.strip()}
 
 	def run():
 		for set_info in self.test_sets:
@@ -212,7 +217,23 @@ class Driver(process):
 			txs = set_info['transactions']
 			live_nodes = set(set_info['live_nodes']) if set_info['live_nodes'] else set(self.node_map.keys())
 
+			# Allow skipping sets via env or optional prompt
+			if str(set_id) in self.skip_sets:
+				log_info(f"Skipping set {set_id} (SKIP_SETS)")
+				continue
+			if self.prompt_sets:
+				try:
+					ans = input(f"Run set {set_id}? [Enter=run / s=skip]: ").strip().lower()
+				except Exception:
+					ans = ''
+				if ans.startswith('s'):
+					log_info(f"Skipping set {set_id} (user input)")
+					continue
+
 			# Flush state
+			self.pending.clear()
+			self.stats.clear()
+			self.balance_responses.clear()
 			send(('RESET',), to=list(self.all_nodes))
 			time.sleep(TIMEOUT * 0.2)
 
@@ -289,19 +310,95 @@ class Driver(process):
 			avg_lat = (lat_sum / total) if total else 0.0
 			log_info(f"Set {set_id} throughput={throughput:.2f} tx/s avg_lat={avg_lat:.3f}s count={total}")
 			self.stats[set_id] = {'throughput': throughput, 'avg_lat': avg_lat, 'count': total}
+			output(f"Set {set_id} throughput={throughput:.2f} avg_lat={avg_lat:.3f}s count={total}")
 
 			send(('PRINT_DB', set_id), to=list(self.all_nodes))
 			send(('PRINT_VIEW', set_id), to=list(self.all_nodes))
 			time.sleep(TIMEOUT * 0.2)
+
+			if self.prompt_balance and not getattr(self, 'skip_next_set', False):
+				while True:
+					prompt = f"Set {set_id} done. Commands: PrintBalance(ID), 'next'/'n' continue, 'skip' skip next set, 'q'/'exit' stop: "
+					output(prompt)
+					cmd = ''
+					try:
+						cmd = input().strip()
+					except EOFError:
+						# Try to reattach to console on Windows
+						try:
+							import sys as _sys
+							_fin = open('CONIN$', 'r')
+							_sys.stdin = _fin
+							cmd = input().strip()
+						except Exception:
+							output("PROMPT_BALANCE: no stdin available, skipping")
+							cmd = ''
+					if cmd.lower() in ('q', 'exit'):
+						send(('STOP',), to=list(self.all_nodes))
+						return
+					if cmd.lower() == 'skip':
+						self.skip_next_set = True
+						break
+					if cmd.lower() in ('next', 'n'):
+						break
+					if not cmd:
+						output("Please enter a command. Use 'next' or 'n' to continue.")
+						continue
+					to_run = []
+					payload = cmd.replace('PrintBalance', '').replace('(', '').replace(')', '')
+					for part in payload.split(','):
+						p = part.strip()
+						if p.isdigit():
+							to_run.append(int(p))
+					for key in to_run:
+						self._print_balance(key)
+			else:
+				self.skip_next_set = False
 
 		send(('STOP',), to=list(self.all_nodes))
 
 	def receive(msg=('TX_RESULT', req_id, result)):
 		self.pending[req_id] = result
 
+	def receive(msg=('BALANCE_RESULT', req_id, node_name, bal)):
+		bucket = self.balance_responses.get(req_id)
+		if bucket is None:
+			bucket = {}
+			self.balance_responses[req_id] = bucket
+		bucket[node_name] = bal
+
 	def receive(msg=('PRINT_PERF',)):
-		for sid, stat in self.stats.items():
+		if not self.stats:
+			output("Performance: []")
+			return
+		for sid in sorted(self.stats.keys()):
+			stat = self.stats[sid]
 			output(f"Set {sid} throughput={stat['throughput']:.2f} avg_lat={stat['avg_lat']:.3f}s count={stat['count']}")
+
+	def receive(msg=('PRINT_BALANCE', key_id)):
+		self._print_balance(key_id)
+
+	def _print_balance(key_id:int):
+		shard = shard_for(key_id)
+		targets = list(self.clusters.get(shard, set()))
+		if not targets:
+			output(f"PrintBalance({key_id}): []")
+			return
+		req_id = (key_id, time.time())
+		self.balance_responses[req_id] = {}
+		send(('GET_BALANCE', key_id, req_id, self), to=targets)
+		deadline = time.time() + TIMEOUT
+		while time.time() < deadline:
+			if len(self.balance_responses.get(req_id, {})) >= len(targets):
+				break
+			await(timeout(0.05))
+		results = self.balance_responses.pop(req_id, {})
+		ordered = [f"{name} : {results.get(name, '?')}" for name in sorted(results.keys())]
+		if ordered:
+			output(f"PrintBalance({key_id}): {', '.join(ordered)}")
+		else:
+			missing = [self.proc_to_name.get(p, str(p)) for p in targets]
+			output(f"PrintBalance({key_id}): missing replies from {missing}")
 
 
 # === Node ===
@@ -353,6 +450,9 @@ class Node(process):
 		self.backlog_prepares = []
 
 		self.new_view_messages = []
+		self.reshard_events = []
+		if self.is_initial_leader:
+			self.new_view_messages.append(('NEW-VIEW', self.ballot_num, len(self.accept_log)))
 
 		self.is_failed = False
 		self.shutdown = False
@@ -994,6 +1094,7 @@ class Node(process):
 		self.backlog_decisions = []
 		self.backlog_prepares = []
 		self.new_view_messages = []
+		self.reshard_events = []
 		self.status = 'LEADER' if self.is_initial_leader else 'FOLLOWER'
 		self.ballot_num = (1, self.node_name, self) if self.is_initial_leader else (0, self.node_name, self)
 		self.leader = self if self.is_initial_leader else self.initial_leader_proc
@@ -1001,6 +1102,8 @@ class Node(process):
 		self.live_peers = set(self.peers)
 		self.live_cluster_size = len(self.live_peers) + 1
 		self.last_leader_msg = time.time()
+		if self.is_initial_leader:
+			self.new_view_messages.append(('NEW-VIEW', self.ballot_num, len(self.accept_log)))
 
 	def receive(msg=('PRINT_DB', set_id)):
 		if not self.modified_keys:
@@ -1013,15 +1116,25 @@ class Node(process):
 		output(f"Set {set_id} {self.node_name} DB: {changed}")
 
 	def receive(msg=('PRINT_VIEW', set_id)):
-		for nv in self.new_view_messages:
-			output(f"Set {set_id} {self.node_name} View: {nv}")
+		if not self.new_view_messages:
+			output(f"Set {set_id} {self.node_name} View: []")
+			return
+		for tag, ballot, log_len in self.new_view_messages:
+			b_round = ballot[0] if isinstance(ballot, tuple) and len(ballot) > 0 else ballot
+			b_leader = ballot[1] if isinstance(ballot, tuple) and len(ballot) > 1 else ''
+			output(f"Set {set_id} {self.node_name} View: {tag} {b_round} {b_leader} {log_len}")
 
 	def receive(msg=('PRINT_BALANCE', key_id)):
-		bal = self.db.get(key_id, 10)
+		bal = self.db.get(key_id, INITIAL_BALANCE)
 		output(f"{self.node_name} : {bal}")
 
+	def receive(msg=('GET_BALANCE', key_id, req_id, requester)):
+		bal = self.db.get(key_id, INITIAL_BALANCE)
+		send(('BALANCE_RESULT', req_id, self.node_name, bal), to=requester)
+
 	def receive(msg=('PRINT_RESHARD',)):
-		output(f"{self.node_name} RESHARD: []")
+		moves = getattr(self, 'reshard_events', []) or []
+		output(f"{self.node_name} RESHARD: {moves}")
 
 	def receive(msg=('STOP',)):
 		self.shutdown = True
