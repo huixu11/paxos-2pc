@@ -287,8 +287,9 @@ class Node(process):
 				await(self.is_failed == False or self.shutdown)
 				continue
 
-			if self.status == 'LEADER' and self.live_peers:
-				send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
+			if self.status == 'LEADER':
+				if self.live_peers:
+					send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
 				await(timeout(HEARTBEAT_INTERVAL))
 				# Resend outstanding 2PC decisions if needed
 				now = time.time()
@@ -299,6 +300,8 @@ class Node(process):
 						if targets:
 							send(('DECISION', txid, desc), to=targets)
 							self.decision_outbox[txid]['last_sent'] = now
+				# Drive any fully prepared-but-undecided 2PCs after leadership changes.
+				drive_pending_decisions()
 				for txid, meta in list(self.pending_2pc.items()):
 					if now - meta.get('ts', now) > TIMEOUT and txid in self.tx_meta:
 						decision = 'ABORT'
@@ -333,6 +336,19 @@ class Node(process):
 						self.last_leader_msg = now
 
 	# === Heartbeats & Election ===
+	def drive_pending_decisions():
+		for txid, meta in list(self.tx_meta.items()):
+			if not meta or meta.get('decision'):
+				continue
+			if meta.get('prepared', {}).get('COORD') and meta.get('prepared', {}).get('PART'):
+				decision = 'COMMIT'
+				seq_c = meta.get('commit_seq', meta.get('prepare_seq', self.next_seq))
+				propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
+				for shard in meta.get('participants', ()): 
+					targets = self.cluster_map.get(shard, set())
+					if targets:
+						send(('DECISION', txid, decision), to=targets)
+						self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time()}
 	def handle_timer_expiry():
 		if self.status != 'FOLLOWER' or self.is_failed:
 			return
