@@ -16,7 +16,7 @@ def timeout(t: float):
 
 # === Configuration ===
 TIMEOUT = 3.0            # Base client/driver timeout
-TWO_PC_TIMEOUT = 2.5     # Internal 2PC wait (must be < client TIMEOUT)
+TWO_PC_TIMEOUT = 2.8     # Internal 2PC wait (must be < client TIMEOUT)
 HEARTBEAT_INTERVAL = 0.4
 HEARTBEAT_TIMEOUT = 1.0
 ELECTION_TIMEOUT = 1.5   # Faster failover to fit client timeout
@@ -836,8 +836,9 @@ class Node(process):
 		if txid in self.pending_2pc:
 			self.pending_2pc[txid].setdefault('participants_ready', set()).add(meta.get('participants', ())[0])
 		if self.status != 'LEADER':
-			if self.current_leader:
-				send(('PREPARED', txid), to=self.current_leader)
+			fresh = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
+			if fresh:
+				send(('PREPARED', txid), to=fresh)
 			else:
 				self.backlog_prepared.add(txid)
 				ensure_leader()
@@ -857,8 +858,9 @@ class Node(process):
 		if not meta:
 			return
 		if self.status != 'LEADER':
-			if self.current_leader:
-				send(('ABORT_TX', txid), to=self.current_leader)
+			fresh = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
+			if fresh:
+				send(('ABORT_TX', txid), to=fresh)
 			else:
 				self.backlog_decisions.append((txid, 'ABORT'))
 				ensure_leader()
