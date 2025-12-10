@@ -520,6 +520,8 @@ class Node(process):
 		self.backlog_prepared = set()
 		self.backlog_decisions = []
 		self.backlog_prepares = []
+		# Track PREPARED messages that need retry (txid -> {coord_shard, last_sent, decision_received})
+		self.pending_prepared_outbox = {}
 
 		self.new_view_messages = []
 		self.reshard_events = []
@@ -583,6 +585,17 @@ class Node(process):
 								send(('DECISION', txid, decision), to=targets)
 								self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': now, 'client': self.tx_meta[txid].get('client')}
 						del self.pending_2pc[txid]
+				# Retry pending PREPARED messages to coordinator
+				for txid, info in list(self.pending_prepared_outbox.items()):
+					if info.get('decision_received'):
+						del self.pending_prepared_outbox[txid]
+						continue
+					if now - info.get('last_sent', 0) >= PREPARE_RETRY_INTERVAL:
+						coord_shard = info.get('coord_shard')
+						targets = self.cluster_map.get(coord_shard, set())
+						if targets:
+							send(('PREPARED', txid), to=targets)
+							self.pending_prepared_outbox[txid]['last_sent'] = now
 			elif self.status == 'FOLLOWER':
 				old = self.last_leader_msg
 				jitter = random.uniform(0, ELECTION_JITTER)
@@ -893,6 +906,8 @@ class Node(process):
 				targets = self.cluster_map.get(coord_shard, set())
 				if targets:
 					send(('PREPARED', txid), to=targets)
+					# Store for retry if DECISION not received
+					self.pending_prepared_outbox[txid] = {'coord_shard': coord_shard, 'last_sent': time.time(), 'decision_received': False}
 		if role == 'COORD' and self.status == 'LEADER' and meta['prepared'].get('PART') and not meta.get('decision'):
 			decision = 'COMMIT'
 			seq_c = meta.get('commit_seq', meta.get('prepare_seq', self.next_seq))
@@ -1089,6 +1104,9 @@ class Node(process):
 			send(('TX_RESULT', txid, decision), to=client)
 
 	def receive(msg=('DECISION', txid, decision), from_=coord):
+		# Mark pending PREPARED as resolved (stop retrying)
+		if txid in self.pending_prepared_outbox:
+			self.pending_prepared_outbox[txid]['decision_received'] = True
 		meta = self.tx_meta.get(txid)
 		if not meta:
 			# Create a stub so we can honor the decision and ack; avoids losing coord replies
@@ -1165,6 +1183,7 @@ class Node(process):
 		self.backlog_prepared = set()
 		self.backlog_decisions = []
 		self.backlog_prepares = []
+		self.pending_prepared_outbox = {}
 		self.new_view_messages = []
 		self.reshard_events = []
 		self.status = 'LEADER' if self.is_initial_leader else 'FOLLOWER'
