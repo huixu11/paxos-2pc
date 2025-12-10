@@ -5,6 +5,8 @@ import time
 import csv
 import random
 import threading
+import os
+import sqlite3
 from da import *  # DistAlgo primitives
 
 # Provide a timeout helper when DA runtime does not supply one in run loop
@@ -24,6 +26,7 @@ MAX_CANDIDATE_TIME = 2 * ELECTION_TIMEOUT
 ELECTION_JITTER = 0.4
 
 VERBOSE_LOG = False
+INITIAL_BALANCE = 10
 
 
 # === Logging Helpers ===
@@ -78,6 +81,78 @@ def shard_for(key:int):
 	if key <= 6000:
 		return 2
 	return 3
+
+
+def shard_bounds(shard_id:int):
+	if shard_id == 1:
+		return (1, 3000)
+	if shard_id == 2:
+		return (3001, 6000)
+	return (6001, 9000)
+
+
+class PersistentStore:
+	"""SQLite-backed key/balance store with a dict-like surface."""
+
+	def __init__(self, node_name:str, shard_id:int, base_dir:str = "data"):
+		self.node_name = node_name
+		self.shard_id = shard_id
+		self.base_dir = base_dir
+		os.makedirs(base_dir, exist_ok=True)
+		self.path = os.path.join(base_dir, f"{node_name}_shard{shard_id}.sqlite")
+		self.conn = sqlite3.connect(self.path, check_same_thread=False)
+		self.conn.execute("PRAGMA journal_mode=WAL")
+		self.conn.execute("CREATE TABLE IF NOT EXISTS accounts (key INTEGER PRIMARY KEY, balance INTEGER)")
+		self.conn.commit()
+		self._preload_if_empty()
+
+	def _preload_if_empty(self):
+		cur = self.conn.execute("SELECT COUNT(*) FROM accounts")
+		row = cur.fetchone()
+		if not row or row[0] == 0:
+			start, end = shard_bounds(self.shard_id)
+			rows = [(k, INITIAL_BALANCE) for k in range(start, end + 1)]
+			self.conn.executemany("INSERT INTO accounts(key, balance) VALUES (?, ?)", rows)
+			self.conn.commit()
+
+	def reset(self):
+		start, end = shard_bounds(self.shard_id)
+		self.conn.execute("DELETE FROM accounts")
+		rows = [(k, INITIAL_BALANCE) for k in range(start, end + 1)]
+		self.conn.executemany("INSERT INTO accounts(key, balance) VALUES (?, ?)", rows)
+		self.conn.commit()
+
+	def _upsert_default(self, key:int, value:int):
+		self.conn.execute("INSERT OR REPLACE INTO accounts(key, balance) VALUES (?, ?)", (key, value))
+		self.conn.commit()
+		return value
+
+	def get(self, key:int, default=None):
+		cur = self.conn.execute("SELECT balance FROM accounts WHERE key=?", (key,))
+		row = cur.fetchone()
+		if row is None:
+			return default
+		return row[0]
+
+	def __getitem__(self, key:int):
+		val = self.get(key, INITIAL_BALANCE)
+		return self._upsert_default(key, val)
+
+	def __setitem__(self, key:int, value:int):
+		self._upsert_default(key, value)
+
+	def __contains__(self, key:int):
+		cur = self.conn.execute("SELECT 1 FROM accounts WHERE key=? LIMIT 1", (key,))
+		return cur.fetchone() is not None
+
+	def items(self):
+		return [(row[0], row[1]) for row in self.conn.execute("SELECT key, balance FROM accounts")]
+
+	def keys(self):
+		return [row[0] for row in self.conn.execute("SELECT key FROM accounts")]
+
+	def values(self):
+		return [row[0] for row in self.conn.execute("SELECT balance FROM accounts")]
 
 
 # === Parsing ===
@@ -261,7 +336,7 @@ class Node(process):
 		self.live_peers = set(self.peers)
 		self.live_cluster_size = len(self.live_peers) + 1
 
-		self.db = {}
+		self.db = PersistentStore(node_name, cluster_id)
 		self.client_replies = {}
 		self.pending_requests = set()
 		self.sent_replies = set()
@@ -415,17 +490,17 @@ class Node(process):
 			pending_prepared = list(self.backlog_prepared)
 			self.backlog_prepared.clear()
 			for txid in pending_prepared:
-				receive(('PREPARED', txid), from_=self)
+				send(('PREPARED', txid), to=self)
 		if self.backlog_decisions:
 			pending_dec = list(self.backlog_decisions)
 			self.backlog_decisions = []
 			for txid, decision in pending_dec:
-				receive(('DECISION', txid, decision), from_=self)
+				send(('DECISION', txid, decision), to=self)
 		if self.backlog_prepares:
 			pending_preps = list(self.backlog_prepares)
 			self.backlog_prepares = []
 			for txid, tx, coord_shard, seq_p, seq_c in pending_preps:
-				receive(('PREPARE_TX', txid, tx, coord_shard, seq_p, seq_c), from_=self)
+				send(('PREPARE_TX', txid, tx, coord_shard, seq_p, seq_c), to=self)
 
 	# === Paxos message handlers ===
 	def receive(msg=('HEARTBEAT', b, leader_proc), from_=p):
@@ -855,7 +930,7 @@ class Node(process):
 		self.promises = {}
 		self.next_seq = 1
 		self.last_executed = 0
-		self.db = {}
+		self.db.reset()
 		self.locks = {}
 		self.tx_table = {}
 		self.tx_meta = {}
