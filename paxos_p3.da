@@ -15,7 +15,7 @@ def timeout(t: float):
 	return True
 
 # === Configuration ===
-TIMEOUT = 3.0            # Base client/driver timeout
+TIMEOUT = 3.0            # Base client/driver timeout (allows more 2PC retries under churn)
 TWO_PC_TIMEOUT = 2.8     # Internal 2PC wait (must be < client TIMEOUT)
 HEARTBEAT_INTERVAL = 0.4
 HEARTBEAT_TIMEOUT = 1.0
@@ -380,7 +380,10 @@ class Node(process):
 						targets = info.get('targets', set())
 						if targets:
 							send(('DECISION', txid, desc), to=targets)
-							self.decision_outbox[txid]['last_sent'] = now
+						self.decision_outbox[txid]['last_sent'] = now
+						client = info.get('client')
+						if client:
+							send(('TX_RESULT', txid, desc), to=client)
 				# Drive any fully prepared-but-undecided 2PCs after leadership changes.
 				drive_pending_decisions()
 				for txid, meta in list(self.pending_2pc.items()):
@@ -400,13 +403,13 @@ class Node(process):
 									self.pending_2pc[txid] = meta
 					if now - meta.get('ts', now) > TWO_PC_TIMEOUT and txid in self.tx_meta:
 						decision = 'ABORT'
-						seq_c = self.tx_meta[txid].get('commit_seq', self.tx_meta[txid].get('prepare_seq', self.next_seq))
+						seq_c = self.tx_meta[txid].get('commit_seq') or self.tx_meta[txid].get('prepare_seq') or self.next_seq
 						propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
 						for shard in self.tx_meta[txid].get('participants', ()): 
 							targets = self.cluster_map.get(shard, set())
 							if targets:
 								send(('DECISION', txid, decision), to=targets)
-								self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': now}
+								self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': now, 'client': self.tx_meta[txid].get('client')}
 						del self.pending_2pc[txid]
 			elif self.status == 'FOLLOWER':
 				old = self.last_leader_msg
@@ -418,6 +421,22 @@ class Node(process):
 					pass
 				elif timeout(to_wait):
 					handle_timer_expiry()
+				# Periodically replay backlog queues even as follower to avoid loss
+				if self.backlog_prepares:
+					pending_preps = list(self.backlog_prepares)
+					self.backlog_prepares = []
+					for txid, tx, coord_shard, seq_p, seq_c in pending_preps:
+						send(('PREPARE_TX', txid, tx, coord_shard, seq_p, seq_c), to=self)
+				if self.backlog_prepared:
+					pending_prepared = list(self.backlog_prepared)
+					self.backlog_prepared.clear()
+					for txid in pending_prepared:
+						send(('PREPARED', txid), to=self)
+				if self.backlog_decisions:
+					pending_dec = list(self.backlog_decisions)
+					self.backlog_decisions = []
+					for txid, decision in pending_dec:
+						send(('DECISION', txid, decision), to=self)
 			else:  # CANDIDATE
 				if await(self.status != 'CANDIDATE' or self.shutdown):
 					pass
@@ -436,14 +455,17 @@ class Node(process):
 			if not meta or meta.get('decision'):
 				continue
 			if meta.get('prepared', {}).get('COORD') and meta.get('prepared', {}).get('PART'):
-				decision = 'COMMIT'
-				seq_c = meta.get('commit_seq', meta.get('prepare_seq', self.next_seq))
-				propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
-				for shard in meta.get('participants', ()): 
-					targets = self.cluster_map.get(shard, set())
-					if targets:
-						send(('DECISION', txid, decision), to=targets)
-						self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time()}
+					decision = 'COMMIT'
+					seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
+					propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
+					client = meta.get('client')
+					for shard in meta.get('participants', ()): 
+						targets = self.cluster_map.get(shard, set())
+						if targets:
+							send(('DECISION', txid, decision), to=targets)
+							self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time(), 'client': client}
+					if client:
+						send(('TX_RESULT', txid, decision), to=client)
 	def handle_timer_expiry():
 		if self.status != 'FOLLOWER' or self.is_failed:
 			return
@@ -724,9 +746,7 @@ class Node(process):
 		else:
 			undo_wal(txid)
 			release_locks(txid)
-		client = meta.get('client')
-		if client and role == 'COORD':
-			send(('TX_RESULT', txid, decision), to=client)
+		maybe_reply_client(txid, decision)
 		if txid in self.pending_2pc:
 			del self.pending_2pc[txid]
 		if role == 'COORD' and txid in self.decision_outbox:
@@ -736,6 +756,12 @@ class Node(process):
 		release_locks(txid)
 		if txid in self.tx_table:
 			del self.tx_table[txid]
+
+	def maybe_reply_client(txid, decision):
+		meta = self.tx_meta.get(txid)
+		client = meta.get('client') if meta else None
+		if client:
+			send(('TX_RESULT', txid, decision), to=client)
 
 	# === 2PC Handlers ===
 	def receive(msg=('CLIENT_TX', tx, txid, client), from_=sender):
@@ -854,13 +880,16 @@ class Node(process):
 			return
 		if meta['prepared'].get('COORD') and not meta.get('decision'):
 			decision = 'COMMIT'
-			seq_c = meta.get('commit_seq', meta.get('prepare_seq', self.next_seq))
+			seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
 			propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
 			participant_shards = meta.get('participants', ())
+			client = meta.get('client')
 			for shard in participant_shards:
 				targets = self.cluster_map.get(shard, set())
 				send(('DECISION', txid, decision), to=targets)
-				self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time()}
+				self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time(), 'client': client}
+			if client:
+				send(('TX_RESULT', txid, decision), to=client)
 
 	def receive(msg=('ABORT_TX', txid), from_=p):
 		meta = self.tx_meta.get(txid)
@@ -876,26 +905,32 @@ class Node(process):
 				ensure_leader()
 			return
 		decision = 'ABORT'
-		seq_c = meta.get('commit_seq', meta.get('prepare_seq', self.next_seq))
+		seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
 		propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
 		participant_shards = meta.get('participants', ())
+		client = meta.get('client')
 		for shard in participant_shards:
 			targets = self.cluster_map.get(shard, set())
 			send(('DECISION', txid, decision), to=targets)
-			self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time()}
+			self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time(), 'client': client}
+		if client:
+			send(('TX_RESULT', txid, decision), to=client)
 
 	def receive(msg=('DECISION', txid, decision), from_=coord):
 		meta = self.tx_meta.get(txid)
 		if not meta:
-			return
+			# Create a stub so we can honor the decision and ack; avoids losing coord replies
+			meta = {'tx': None, 'prepared': {}, 'decision': None, 'prepare_seq': None, 'commit_seq': None, 'client': None, 'participants': (), 'coord_shard': None}
+			self.tx_meta[txid] = meta
 		if meta.get('decision'):
 			return
 		if self.status != 'LEADER':
 			self.backlog_decisions.append((txid, decision))
 			ensure_leader()
 			return
-		seq_c = meta.get('commit_seq', meta.get('prepare_seq', self.next_seq))
+		seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
 		propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'PART'))
+		maybe_reply_client(txid, decision)
 		send(('DECISION_ACK', txid), to=coord)
 
 	def receive(msg=('DECISION_ACK', txid), from_=p):
