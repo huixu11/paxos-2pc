@@ -14,13 +14,13 @@ def timeout(t: float):
 
 # === Configuration ===
 TIMEOUT = 3.0            # Base client/driver timeout
-HEARTBEAT_INTERVAL = 0.5
-HEARTBEAT_TIMEOUT = 1.5
-ELECTION_TIMEOUT = 5.0   # Keep elections responsive
-PREPARE_BACKOFF = 1.0
-PREPARE_RETRY_INTERVAL = 1.0
+HEARTBEAT_INTERVAL = 0.4
+HEARTBEAT_TIMEOUT = 1.0
+ELECTION_TIMEOUT = 1.5   # Faster failover to fit client timeout
+PREPARE_BACKOFF = 0.5
+PREPARE_RETRY_INTERVAL = 0.5
 MAX_CANDIDATE_TIME = 2 * ELECTION_TIMEOUT
-ELECTION_JITTER = 0.5
+ELECTION_JITTER = 0.4
 
 VERBOSE_LOG = False
 
@@ -273,6 +273,7 @@ class Node(process):
 		self.tx_client = {}
 		self.backlog_prepared = set()
 		self.backlog_decisions = []
+		self.backlog_prepares = []
 
 		self.new_view_messages = []
 
@@ -399,6 +400,11 @@ class Node(process):
 			self.backlog_decisions = []
 			for txid, decision in pending_dec:
 				receive(('DECISION', txid, decision), from_=self)
+		if self.backlog_prepares:
+			pending_preps = list(self.backlog_prepares)
+			self.backlog_prepares = []
+			for txid, tx, coord_shard, seq_p, seq_c in pending_preps:
+				receive(('PREPARE_TX', txid, tx, coord_shard, seq_p, seq_c), from_=self)
 
 	# === Paxos message handlers ===
 	def receive(msg=('HEARTBEAT', b, leader_proc), from_=p):
@@ -693,9 +699,9 @@ class Node(process):
 			if fresh_leader:
 				send(('PREPARE_TX', txid, tx, coord_shard, seq_p, seq_c), to=fresh_leader)
 				return
+			self.backlog_prepares.append((txid, tx, coord_shard, seq_p, seq_c))
 			ensure_leader()
-			if self.status != 'LEADER':
-				return
+			return
 		src, dst, amt = tx
 		coord_targets = self.cluster_map.get(coord_shard, set())
 		if not acquire_lock(dst, txid):
@@ -826,6 +832,7 @@ class Node(process):
 		self.tx_client = {}
 		self.backlog_prepared = set()
 		self.backlog_decisions = []
+		self.backlog_prepares = []
 		self.new_view_messages = []
 		self.status = 'LEADER' if self.is_initial_leader else 'FOLLOWER'
 		self.ballot_num = (1, self.node_name, self) if self.is_initial_leader else (0, self.node_name, self)
