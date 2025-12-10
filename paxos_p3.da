@@ -55,14 +55,37 @@ def parse_transaction(tx_str):
 		return None
 	tx_str = tx_str.strip().strip('()')
 	parts = [p.strip() for p in tx_str.split(',')]
+	# Support for consistency level as 4th parameter
+	# Format: (src, dst, amt, consistency) or (src, dst, amt)
+	if len(parts) == 4:
+		try:
+			consistency = parts[3].strip().strip("'\"").lower()
+			if consistency not in ('linearizable', 'eventual', 'read-your-writes', 'ryw'):
+				consistency = 'linearizable'
+			if consistency == 'ryw':
+				consistency = 'read-your-writes'
+			return (int(parts[0]), int(parts[1]), int(parts[2]), consistency)
+		except Exception:
+			return None
 	if len(parts) == 3:
 		try:
-			return (int(parts[0]), int(parts[1]), int(parts[2]))
+			return (int(parts[0]), int(parts[1]), int(parts[2]), 'linearizable')
+		except Exception:
+			return None
+	# Balance query with optional consistency level
+	if len(parts) == 2:
+		try:
+			consistency = parts[1].strip().strip("'\"").lower()
+			if consistency not in ('linearizable', 'eventual', 'read-your-writes', 'ryw'):
+				consistency = 'linearizable'
+			if consistency == 'ryw':
+				consistency = 'read-your-writes'
+			return (int(parts[0]), consistency)
 		except Exception:
 			return None
 	if len(parts) == 1:
 		try:
-			return (int(parts[0]),)
+			return (int(parts[0]), 'linearizable')
 		except Exception:
 			return None
 	return None
@@ -75,20 +98,46 @@ def parse_live_nodes(nodes_str):
 	return [n.strip() for n in nodes_str.split(',') if n.strip()]
 
 
+# === Configurable Cluster Settings ===
+# Global configuration (can be overridden by CLI args)
+CLUSTER_CONFIG = {
+	'num_clusters': 3,
+	'nodes_per_cluster': 3,
+	'total_keys': 9000,
+	'shard_map': {1: (1, 3000), 2: (3001, 6000), 3: (6001, 9000)}
+}
+
+def generate_shard_map(num_clusters:int, total_keys:int = 9000):
+	"""Generate shard map for given number of clusters."""
+	keys_per_shard = total_keys // num_clusters
+	shard_map = {}
+	for i in range(1, num_clusters + 1):
+		lo = (i - 1) * keys_per_shard + 1
+		hi = i * keys_per_shard if i < num_clusters else total_keys
+		shard_map[i] = (lo, hi)
+	return shard_map
+
+def generate_nodes(num_clusters:int, nodes_per_cluster:int):
+	"""Generate node names for given configuration."""
+	nodes = []
+	node_idx = 1
+	for _ in range(num_clusters * nodes_per_cluster):
+		nodes.append(f'n{node_idx}')
+		node_idx += 1
+	return nodes
+
 def shard_for(key:int):
-	if key <= 3000:
-		return 1
-	if key <= 6000:
-		return 2
-	return 3
+	"""Get shard ID for a key using configured shard map."""
+	for shard_id, (lo, hi) in CLUSTER_CONFIG['shard_map'].items():
+		if lo <= key <= hi:
+			return shard_id
+	# Fallback: use modular assignment
+	return ((key - 1) % CLUSTER_CONFIG['num_clusters']) + 1
 
 
 def shard_bounds(shard_id:int):
-	if shard_id == 1:
-		return (1, 3000)
-	if shard_id == 2:
-		return (3001, 6000)
-	return (6001, 9000)
+	"""Get key range for a shard using configured shard map."""
+	return CLUSTER_CONFIG['shard_map'].get(shard_id, (1, 3000))
 
 
 class PersistentStore:
@@ -215,6 +264,9 @@ class Driver(process):
 		self.reshard_moves = []
 		# Dynamic shard map (initially same as static)
 		self.dynamic_shard_map = {}
+		# Read-your-writes: track recent writes per key for RYW consistency
+		# client_writes[key] = {'value': balance, 'ts': timestamp}
+		self.client_writes = {}
 
 	def run():
 		for set_info in self.test_sets:
@@ -280,6 +332,18 @@ class Driver(process):
 					dst_shard = shard_for(dst_key)
 					if src_shard != dst_shard:
 						self.tx_history.append((src_key, dst_key, src_shard, dst_shard))
+				
+				# Handle read-your-writes for balance queries at the Driver level
+				if len(tx) == 2 and isinstance(tx[1], str) and tx[1] in ('ryw', 'read-your-writes'):
+					key = tx[0]
+					# Check if we have a cached write for this key
+					if key in self.client_writes:
+						cached = self.client_writes[key]
+						# Return cached value immediately
+						lat_sum += 0.001  # minimal latency
+						total += 1
+						log_info(f"Set {set_id} tx {tx} -> RYW cache hit: balance={cached['value']}")
+						continue
 
 				# Pick cluster leader target
 				shard = shard_for(tx[0]) if len(tx) >= 1 else 1
@@ -375,6 +439,13 @@ class Driver(process):
 
 	def receive(msg=('TX_RESULT', req_id, result)):
 		self.pending[req_id] = result
+		# Track writes for read-your-writes consistency
+		if isinstance(result, tuple) and len(result) == 2:
+			result_type, write_info = result
+			if result_type == 'COMMIT' and isinstance(write_info, dict):
+				# Update client_writes cache with committed key->balance
+				for key, balance in write_info.items():
+					self.client_writes[key] = {'value': balance, 'ts': time.time()}
 
 	def receive(msg=('BALANCE_RESULT', req_id, node_name, bal)):
 		bucket = self.balance_responses.get(req_id)
@@ -965,23 +1036,75 @@ class Node(process):
 		# Skip if we already processed this request
 		if txid in self.tx_client:
 			return
+		
+		# Extract consistency level (last element of tx tuple)
+		consistency = 'linearizable'
+		
+		# Handle balance query: (key,) or (key, consistency)
 		if len(tx) == 1:
+			# Balance query without consistency: (key,) - linearizable
 			cid = tx[0]
-			bal = self.db.get(cid, 10)
+			bal = self.db.get(cid, INITIAL_BALANCE)
 			send(('TX_RESULT', txid, ('BAL', bal)), to=client)
 			self.tx_client[txid] = client
 			return
-		src, dst, amt = tx
+		
+		if len(tx) == 2:
+			cid = tx[0]
+			# Could be (key, consistency) or (src, dst) with missing amt
+			if isinstance(tx[1], str):
+				# Balance query with consistency: (key, consistency)
+				consistency = tx[1]
+				
+				if consistency == 'eventual':
+					# Eventual consistency: read from local replica immediately
+					bal = self.db.get(cid, INITIAL_BALANCE)
+					send(('TX_RESULT', txid, ('BAL', bal, 'eventual')), to=client)
+					self.tx_client[txid] = client
+					return
+				elif consistency in ('ryw', 'read-your-writes'):
+					# Read-your-writes: node returns normal read, Driver handles RYW cache
+					bal = self.db.get(cid, INITIAL_BALANCE)
+					send(('TX_RESULT', txid, ('BAL', bal, 'ryw')), to=client)
+					self.tx_client[txid] = client
+					return
+				else:
+					# Linearizable: normal read
+					bal = self.db.get(cid, INITIAL_BALANCE)
+					send(('TX_RESULT', txid, ('BAL', bal)), to=client)
+					self.tx_client[txid] = client
+					return
+			else:
+				# Invalid format (src, dst) without amount
+				return
+		
+		if len(tx) == 4:
+			# Transfer with consistency: (src, dst, amt, consistency)
+			src, dst, amt, consistency = tx
+		elif len(tx) == 3:
+			# Transfer without explicit consistency
+			src, dst, amt = tx[0], tx[1], tx[2]
+			consistency = 'linearizable'
+		else:
+			return
+		
 		shard_src = shard_for(src)
 		shard_dst = shard_for(dst)
+		
+		# For 'eventual' writes, still need consensus but can be more relaxed
+		# For now, all writes go through normal path
+		
 		if shard_src == self.cluster_id and shard_dst == self.cluster_id:
 			sender_bal = self.db.get(src, 10)
 			if sender_bal < amt:
 				send(('TX_RESULT', txid, 'ABORT'), to=client)
 				self.tx_client[txid] = client
 				return
-			propose(('LOCAL', tx))
-			send(('TX_RESULT', txid, 'COMMIT'), to=client)
+			propose(('LOCAL', (src, dst, amt)))
+			# Include write info for RYW tracking: which keys were written and new balances
+			new_src_bal = sender_bal - amt
+			new_dst_bal = self.db.get(dst, INITIAL_BALANCE) + amt
+			send(('TX_RESULT', txid, ('COMMIT', {src: new_src_bal, dst: new_dst_bal})), to=client)
 			self.tx_client[txid] = client
 			return
 		participants = (shard_dst,)
@@ -996,11 +1119,11 @@ class Node(process):
 			self.tx_client[txid] = client
 			return
 		seq_p = self.next_seq
-		self.tx_meta[txid] = {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': seq_p, 'commit_seq': seq_p, 'client': client, 'participants': participants, 'ts': time.time()}
+		self.tx_meta[txid] = {'tx': (src, dst, amt), 'prepared': {}, 'decision': None, 'prepare_seq': seq_p, 'commit_seq': seq_p, 'client': client, 'participants': participants, 'ts': time.time(), 'consistency': consistency}
 		self.tx_client[txid] = client
-		propose_with_seq(seq_p, ('2PC_PREP', txid, tx, 'COORD'))
+		propose_with_seq(seq_p, ('2PC_PREP', txid, (src, dst, amt), 'COORD'))
 		targets = self.cluster_map.get(shard_dst, set())
-		send(('PREPARE_TX', txid, tx, self.cluster_id, seq_p, seq_p), to=targets)
+		send(('PREPARE_TX', txid, (src, dst, amt), self.cluster_id, seq_p, seq_p), to=targets)
 		self.pending_2pc[txid] = {'state': 'WAIT_PREPARED', 'ts': time.time(), 'seq_p': seq_p, 'participants': set(participants), 'participants_ready': set(), 'last_prepare_sent': time.time()}
 
 	def acquire_lock(key, txid):
@@ -1295,34 +1418,66 @@ def read_tests(csv_file):
 
 
 def main():
-	csv_arg = sys.argv[1] if len(sys.argv) > 1 else 'CSE535-F25-Project-3-Testcases.csv'
-	log_info(f"Using test file: {csv_arg}")
+	import argparse
+	parser = argparse.ArgumentParser(description='Distributed Transaction System')
+	parser.add_argument('csv_file', nargs='?', default='CSE535-F25-Project-3-Testcases.csv',
+						help='Test CSV file')
+	parser.add_argument('--clusters', type=int, default=3,
+						help='Number of clusters (default: 3)')
+	parser.add_argument('--nodes-per-cluster', type=int, default=3,
+						help='Nodes per cluster (default: 3)')
+	parser.add_argument('--total-keys', type=int, default=9000,
+						help='Total number of keys (default: 9000)')
+	args = parser.parse_args()
 
-	node_names = ['n1','n2','n3','n4','n5','n6','n7','n8','n9']
-	nodes = new(Node, num=9)
+	# Update global configuration
+	global CLUSTER_CONFIG
+	CLUSTER_CONFIG['num_clusters'] = args.clusters
+	CLUSTER_CONFIG['nodes_per_cluster'] = args.nodes_per_cluster
+	CLUSTER_CONFIG['total_keys'] = args.total_keys
+	CLUSTER_CONFIG['shard_map'] = generate_shard_map(args.clusters, args.total_keys)
+
+	num_clusters = args.clusters
+	nodes_per_cluster = args.nodes_per_cluster
+	total_nodes = num_clusters * nodes_per_cluster
+
+	log_info(f"Using test file: {args.csv_file}")
+	log_info(f"Configuration: {num_clusters} clusters, {nodes_per_cluster} nodes/cluster, {args.total_keys} keys")
+	log_info(f"Shard map: {CLUSTER_CONFIG['shard_map']}")
+
+	# Generate node names dynamically
+	node_names = generate_nodes(num_clusters, nodes_per_cluster)
+	nodes = new(Node, num=total_nodes)
 	nodes_list = list(nodes)
 
 	node_map = {name: proc for name, proc in zip(node_names, nodes_list)}
-	cluster_map = {
-		1: set(nodes_list[0:3]),
-		2: set(nodes_list[3:6]),
-		3: set(nodes_list[6:9])
-	}
-	leader_lookup = {'n1': node_map['n1'], 'n4': node_map['n4'], 'n7': node_map['n7']}
-	cluster_leaders = {1: leader_lookup['n1'], 2: leader_lookup['n4'], 3: leader_lookup['n7']}
+
+	# Build cluster_map dynamically
+	cluster_map = {}
+	for cid in range(1, num_clusters + 1):
+		start_idx = (cid - 1) * nodes_per_cluster
+		end_idx = start_idx + nodes_per_cluster
+		cluster_map[cid] = set(nodes_list[start_idx:end_idx])
+
+	# Leader for each cluster is the first node in that cluster
+	leader_names = [node_names[(cid - 1) * nodes_per_cluster] for cid in range(1, num_clusters + 1)]
+	leader_lookup = {name: node_map[name] for name in leader_names}
+	cluster_leaders = {cid: node_map[leader_names[cid - 1]] for cid in range(1, num_clusters + 1)}
+
+	log_info(f"Leaders: {leader_names}")
 
 	for i, node in enumerate(nodes_list):
 		name = node_names[i]
-		cid = 1 if i < 3 else (2 if i < 6 else 3)
+		cid = (i // nodes_per_cluster) + 1
 		peers = cluster_map[cid]
-		initial_leader = name in ['n1', 'n4', 'n7']
-		initial_leader_proc = leader_lookup['n1'] if cid == 1 else (leader_lookup['n4'] if cid == 2 else leader_lookup['n7'])
+		initial_leader = (i % nodes_per_cluster) == 0  # First node in each cluster
+		initial_leader_proc = cluster_leaders[cid]
 		setup(node, (name, cid, peers, set(nodes_list), cluster_map, initial_leader, initial_leader_proc))
 
 	start(nodes)
 
 	driver = new(Driver, num=1)
-	setup(driver, (csv_arg, node_map, cluster_map, cluster_leaders))
+	setup(driver, (args.csv_file, node_map, cluster_map, cluster_leaders))
 	start(driver)
 
 	# Main returns; runtime will join child processes
