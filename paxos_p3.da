@@ -72,9 +72,9 @@ def parse_live_nodes(nodes_str):
 
 
 def shard_for(key:int):
-	if key < 3000:
+	if key <= 3000:
 		return 1
-	if key < 6000:
+	if key <= 6000:
 		return 2
 	return 3
 
@@ -266,6 +266,11 @@ class Node(process):
 		self.sent_replies = set()
 		self.locks = {}
 		self.tx_table = {}
+		self.tx_meta = {}
+		self.wal = {}
+		self.decision_outbox = {}
+		self.pending_2pc = {}
+		self.tx_client = {}
 
 		self.new_view_messages = []
 
@@ -282,6 +287,26 @@ class Node(process):
 			if self.status == 'LEADER' and self.live_peers:
 				send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
 				await(timeout(HEARTBEAT_INTERVAL))
+				# Resend outstanding 2PC decisions if needed
+				now = time.time()
+				for txid, info in list(self.decision_outbox.items()):
+					if now - info.get('last_sent', 0) >= PREPARE_RETRY_INTERVAL:
+						desc = info.get('decision')
+						targets = info.get('targets', set())
+						if targets:
+							send(('DECISION', txid, desc), to=targets)
+							self.decision_outbox[txid]['last_sent'] = now
+				for txid, meta in list(self.pending_2pc.items()):
+					if now - meta.get('ts', now) > TIMEOUT * 2 and txid in self.tx_meta:
+						decision = 'ABORT'
+						seq_c = self.tx_meta[txid].get('commit_seq', self.next_seq)
+						propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
+						for shard in self.tx_meta[txid].get('participants', ()): 
+							targets = self.cluster_map.get(shard, set())
+							if targets:
+								send(('DECISION', txid, decision), to=targets)
+								self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': now}
+						del self.pending_2pc[txid]
 			elif self.status == 'FOLLOWER':
 				old = self.last_leader_msg
 				jitter = random.uniform(0, ELECTION_JITTER)
@@ -477,40 +502,15 @@ class Node(process):
 		if tag == 'LOCAL':
 			_, tx = val
 			apply_local(tx)
-		elif tag == '2PC_BEGIN':
-			_, txid, tx, participants, client = val
-			participants = tuple(participants)
-			self.tx_table[txid] = {'state': 'PREPARING', 'tx': tx, 'participants': participants, 'client': client, 'votes': {}}
-			for shard in participants:
-				targets = self.cluster_map.get(shard, set())
-				send(('PREPARE_TX', txid, tx, self.cluster_id), to=targets)
-		elif tag == '2PC_VOTE':
-			_, txid, vote = val
-			meta = self.tx_table.get(txid, {'state': 'VOTED'})
-			meta['state'] = 'VOTED'
-			meta['vote'] = vote
-			self.tx_table[txid] = meta
-		elif tag == '2PC_DECIDE':
-			_, txid, decision = val
-			meta = self.tx_table.get(txid, {})
-			meta['decision'] = decision
-			meta['state'] = 'DECIDED'
-			self.tx_table[txid] = meta
-			tx = meta.get('tx')
-			participants = tuple(meta.get('participants', ()))
-			for shard in participants:
-				targets = self.cluster_map.get(shard, set())
-				send(('DECIDE_TX', txid, decision, tx), to=targets)
-			client = meta.get('client')
-			if client:
-				send(('TX_RESULT', txid, decision), to=client)
-			if tx:
-				propose(('2PC_APPLY', txid, tx, decision))
-		elif tag == '2PC_APPLY':
-			_, txid, tx, decision = val
-			if decision == 'COMMIT':
-				apply_commit(tx)
-			cleanup_tx(txid)
+		elif tag == '2PC_PREP':
+			_, txid, tx, role = val
+			apply_prepare_entry(txid, tx, role, commit_allowed=True)
+		elif tag == '2PC_PREP_ABORT':
+			_, txid, tx, role = val
+			apply_prepare_entry(txid, tx, role, commit_allowed=False)
+		elif tag == '2PC_DECISION':
+			_, txid, decision, role = val
+			apply_decision_entry(txid, decision, role)
 		elif tag == 'NO-OP':
 			pass
 
@@ -525,16 +525,56 @@ class Node(process):
 		self.db[src] -= amt
 		self.db[dst] += amt
 
-	def apply_commit(tx):
+	def apply_prepare_entry(txid, tx, role, commit_allowed:bool):
 		src, dst, amt = tx
-		if src not in self.db:
-			self.db[src] = 10
-		if dst not in self.db:
-			self.db[dst] = 10
-		if shard_for(src) == self.cluster_id:
-			self.db[src] -= amt
-		if shard_for(dst) == self.cluster_id:
-			self.db[dst] += amt
+		meta = self.tx_meta.setdefault(txid, {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': None, 'commit_seq': None, 'client': None, 'participants': ()})
+		if commit_allowed:
+			if role == 'COORD':
+				record_wal(src, txid)
+				self.db[src] = self.db.get(src, 10) - amt
+			elif role == 'PART':
+				record_wal(dst, txid)
+				self.db[dst] = self.db.get(dst, 10) + amt
+		meta['prepared'][role] = commit_allowed
+		self.tx_meta[txid] = meta
+		if role == 'PART':
+			coord_shard = meta.get('coord_shard')
+			if coord_shard:
+				targets = self.cluster_map.get(coord_shard, set())
+				if targets:
+					send(('PREPARED', txid), to=targets)
+		if role == 'COORD' and self.status == 'LEADER' and meta['prepared'].get('PART') and not meta.get('decision'):
+			decision = 'COMMIT'
+			seq_c = meta.get('commit_seq', self.next_seq)
+			propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
+			for shard in meta.get('participants', ()): 
+				targets = self.cluster_map.get(shard, set())
+				send(('DECISION', txid, decision), to=targets)
+				self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time()}
+
+	def apply_decision_entry(txid, decision, role):
+		meta = self.tx_meta.get(txid)
+		if not meta:
+			return
+		if meta.get('decision') and meta['decision'] == decision:
+			return
+		meta['decision'] = decision
+		self.tx_meta[txid] = meta
+		tx = meta.get('tx')
+		if decision == 'COMMIT':
+			release_locks(txid)
+			if txid in self.wal:
+				del self.wal[txid]
+		else:
+			undo_wal(txid)
+			release_locks(txid)
+		client = meta.get('client')
+		if client and role == 'COORD':
+			send(('TX_RESULT', txid, decision), to=client)
+		if txid in self.pending_2pc:
+			del self.pending_2pc[txid]
+		if role == 'COORD' and txid in self.decision_outbox:
+			del self.decision_outbox[txid]
 
 	def cleanup_tx(txid):
 		release_locks(txid)
@@ -578,7 +618,14 @@ class Node(process):
 			release_locks(txid)
 			send(('TX_RESULT', txid, 'ABORT'), to=client)
 			return
-		propose(('2PC_BEGIN', txid, tx, participants, client))
+		seq_p = self.next_seq
+		seq_c = seq_p + 1
+		self.tx_meta[txid] = {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': seq_p, 'commit_seq': seq_c, 'client': client, 'participants': participants, 'ts': time.time()}
+		self.tx_client[txid] = client
+		propose_with_seq(seq_p, ('2PC_PREP', txid, tx, 'COORD'))
+		targets = self.cluster_map.get(shard_dst, set())
+		send(('PREPARE_TX', txid, tx, self.cluster_id, seq_p, seq_c), to=targets)
+		self.pending_2pc[txid] = {'state': 'WAIT_PREPARED', 'ts': time.time(), 'seq_p': seq_p, 'seq_c': seq_c}
 
 	def acquire_lock(key, txid):
 		holder = self.locks.get(key)
@@ -594,13 +641,23 @@ class Node(process):
 			if v == txid:
 				del self.locks[k]
 
-	def receive(msg=('PREPARE_TX', txid, tx, coord_shard), from_=leader):
+	def record_wal(key, txid):
+		prev = self.db.get(key, 10)
+		self.wal.setdefault(txid, []).append((key, prev))
+
+	def undo_wal(txid):
+		for key, prev in self.wal.get(txid, []):
+			self.db[key] = prev
+		if txid in self.wal:
+			del self.wal[txid]
+
+	def receive(msg=('PREPARE_TX', txid, tx, coord_shard, seq_p, seq_c), from_=leader):
 		if self.is_failed:
 			return
 		if self.status != 'LEADER':
 			fresh_leader = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
 			if fresh_leader:
-				send(('PREPARE_TX', txid, tx, coord_shard), to=fresh_leader)
+				send(('PREPARE_TX', txid, tx, coord_shard, seq_p, seq_c), to=fresh_leader)
 				return
 			ensure_leader()
 			if self.status != 'LEADER':
@@ -608,49 +665,81 @@ class Node(process):
 		src, dst, amt = tx
 		coord_targets = self.cluster_map.get(coord_shard, set())
 		if not acquire_lock(dst, txid):
-			propose(('2PC_VOTE', txid, 'ABORT'))
-			send(('VOTE', txid, 'ABORT'), to=coord_targets)
+			propose_with_seq(seq_p, ('2PC_PREP_ABORT', txid, tx, 'PART'))
+			send(('ABORT_TX', txid), to=coord_targets)
 			return
-		propose(('2PC_VOTE', txid, 'COMMIT'))
-		send(('VOTE', txid, 'COMMIT'), to=coord_targets)
+		self.tx_meta[txid] = {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': seq_p, 'commit_seq': seq_c, 'client': None, 'participants': (self.cluster_id,), 'ts': time.time(), 'coord_shard': coord_shard}
+		propose_with_seq(seq_p, ('2PC_PREP', txid, tx, 'PART'))
 
-	def receive(msg=('VOTE', txid, vote), from_=p):
-		meta = self.tx_table.get(txid)
-		if not meta or meta.get('state') != 'PREPARING':
+	def receive(msg=('PREPARED', txid), from_=p):
+		meta = self.tx_meta.get(txid)
+		if not meta:
 			return
-		vote_shard = None
-		for sid, members in self.cluster_map.items():
-			if p in members:
-				vote_shard = sid
-				break
-		if vote_shard is None:
+		if meta.get('decision'):
 			return
-		if vote_shard in meta['votes']:
+		meta.setdefault('prepared', {})['PART'] = True
+		self.tx_meta[txid] = meta
+		if self.status != 'LEADER':
+			if self.current_leader:
+				send(('PREPARED', txid), to=self.current_leader)
 			return
-		meta['votes'][vote_shard] = vote
-		self.tx_table[txid] = meta
-		if all(v == 'COMMIT' for v in meta['votes'].values()) and len(meta['votes']) == len(meta['participants']):
-			propose(('2PC_DECIDE', txid, 'COMMIT'))
-		elif any(v == 'ABORT' for v in meta['votes'].values()):
-			propose(('2PC_DECIDE', txid, 'ABORT'))
+		if meta['prepared'].get('COORD') and not meta.get('decision'):
+			decision = 'COMMIT'
+			seq_c = meta.get('commit_seq', self.next_seq)
+			propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
+			participant_shards = meta.get('participants', ())
+			for shard in participant_shards:
+				targets = self.cluster_map.get(shard, set())
+				send(('DECISION', txid, decision), to=targets)
+				self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time()}
 
-	def receive(msg=('DECIDE_TX', txid, decision, tx), from_=coord):
-		if self.is_failed:
+	def receive(msg=('ABORT_TX', txid), from_=p):
+		meta = self.tx_meta.get(txid)
+		if not meta:
+			return
+		if self.status != 'LEADER':
+			if self.current_leader:
+				send(('ABORT_TX', txid), to=self.current_leader)
+			return
+		decision = 'ABORT'
+		seq_c = meta.get('commit_seq', self.next_seq)
+		propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
+		participant_shards = meta.get('participants', ())
+		for shard in participant_shards:
+			targets = self.cluster_map.get(shard, set())
+			send(('DECISION', txid, decision), to=targets)
+			self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time()}
+
+	def receive(msg=('DECISION', txid, decision), from_=coord):
+		meta = self.tx_meta.get(txid)
+		if not meta:
+			return
+		if meta.get('decision'):
 			return
 		if self.status != 'LEADER':
 			fresh_leader = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
 			if fresh_leader:
-				send(('DECIDE_TX', txid, decision, tx), to=fresh_leader)
-				return
-			ensure_leader()
-			if self.status != 'LEADER':
-				return
-		propose(('2PC_APPLY', txid, tx, decision))
+				send(('DECISION', txid, decision), to=fresh_leader)
+			return
+		seq_c = meta.get('commit_seq', self.next_seq)
+		propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'PART'))
+		send(('DECISION_ACK', txid), to=coord)
+
+	def receive(msg=('DECISION_ACK', txid), from_=p):
+		if txid in self.decision_outbox:
+			del self.decision_outbox[txid]
 
 	# === Paxos propose ===
 	def propose(val):
 		seq = self.next_seq
 		self.next_seq += 1
+		self.accept_log.add((self.ballot_num, seq, val))
+		send(('ACCEPT', self.ballot_num, seq, val), to=self.live_peers)
+		send(('ACCEPTED', self.ballot_num, seq, val, self), to=self)
+
+	def propose_with_seq(seq, val):
+		if seq >= self.next_seq:
+			self.next_seq = seq + 1
 		self.accept_log.add((self.ballot_num, seq, val))
 		send(('ACCEPT', self.ballot_num, seq, val), to=self.live_peers)
 		send(('ACCEPTED', self.ballot_num, seq, val, self), to=self)
@@ -687,6 +776,11 @@ class Node(process):
 		self.db = {}
 		self.locks = {}
 		self.tx_table = {}
+		self.tx_meta = {}
+		self.wal = {}
+		self.decision_outbox = {}
+		self.pending_2pc = {}
+		self.tx_client = {}
 		self.new_view_messages = []
 		self.status = 'LEADER' if self.is_initial_leader else 'FOLLOWER'
 		self.ballot_num = (1, self.node_name, self) if self.is_initial_leader else (0, self.node_name, self)
