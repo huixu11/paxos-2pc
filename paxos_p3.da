@@ -335,6 +335,7 @@ class Node(process):
 		self.leader_grace_until = 0.0
 		self.live_peers = set(self.peers)
 		self.live_cluster_size = len(self.live_peers) + 1
+		self.modified_keys = set()
 
 		self.db = PersistentStore(node_name, cluster_id)
 		self.client_replies = {}
@@ -675,6 +676,8 @@ class Node(process):
 			return
 		self.db[src] -= amt
 		self.db[dst] += amt
+		self.modified_keys.add(src)
+		self.modified_keys.add(dst)
 
 	def apply_prepare_entry(txid, tx, role, commit_allowed:bool):
 		src, dst, amt = tx
@@ -683,9 +686,11 @@ class Node(process):
 			if role == 'COORD':
 				record_wal(src, txid)
 				self.db[src] = self.db.get(src, 10) - amt
+				self.modified_keys.add(src)
 			elif role == 'PART':
 				record_wal(dst, txid)
 				self.db[dst] = self.db.get(dst, 10) + amt
+				self.modified_keys.add(dst)
 		meta['prepared'][role] = commit_allowed
 		self.tx_meta[txid] = meta
 		if role == 'PART':
@@ -802,10 +807,12 @@ class Node(process):
 	def record_wal(key, txid):
 		prev = self.db.get(key, 10)
 		self.wal.setdefault(txid, []).append((key, prev))
+		self.modified_keys.add(key)
 
 	def undo_wal(txid):
 		for key, prev in self.wal.get(txid, []):
 			self.db[key] = prev
+			self.modified_keys.add(key)
 		if txid in self.wal:
 			del self.wal[txid]
 
@@ -940,6 +947,7 @@ class Node(process):
 		self.next_seq = 1
 		self.last_executed = 0
 		self.db.reset()
+		self.modified_keys = set()
 		self.locks = {}
 		self.tx_table = {}
 		self.tx_meta = {}
@@ -960,7 +968,13 @@ class Node(process):
 		self.last_leader_msg = time.time()
 
 	def receive(msg=('PRINT_DB', set_id)):
-		changed = ", ".join([f"{k}:{v}" for k, v in sorted(self.db.items())])
+		if not self.modified_keys:
+			output(f"Set {set_id} {self.node_name} DB: []")
+			return
+		pairs = []
+		for k in sorted(self.modified_keys):
+			pairs.append(f"{k}:{self.db.get(k, INITIAL_BALANCE)}")
+		changed = ", ".join(pairs)
 		output(f"Set {set_id} {self.node_name} DB: {changed}")
 
 	def receive(msg=('PRINT_VIEW', set_id)):
@@ -969,7 +983,7 @@ class Node(process):
 
 	def receive(msg=('PRINT_BALANCE', key_id)):
 		bal = self.db.get(key_id, 10)
-		output(f"{self.node_name}: {bal}")
+		output(f"{self.node_name} : {bal}")
 
 	def receive(msg=('PRINT_RESHARD',)):
 		output(f"{self.node_name} RESHARD: []")
