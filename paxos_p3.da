@@ -210,6 +210,11 @@ class Driver(process):
 		self.prompt_balance = os.environ.get('PROMPT_BALANCE', '').lower() not in ('', '0', 'false', 'no')
 		skip_env = os.environ.get('SKIP_SETS', '')
 		self.skip_sets = {s.strip() for s in skip_env.split(',') if s.strip()}
+		# Resharding: track cross-shard transaction pairs (src_key, dst_key)
+		self.tx_history = []
+		self.reshard_moves = []
+		# Dynamic shard map (initially same as static)
+		self.dynamic_shard_map = {}
 
 	def run():
 		for set_info in self.test_sets:
@@ -268,6 +273,14 @@ class Driver(process):
 				tx = payload
 				txid = (int(set_id), idx)
 
+				# Track cross-shard transactions for resharding analysis
+				if len(tx) == 3:
+					src_key, dst_key, amt = tx
+					src_shard = shard_for(src_key)
+					dst_shard = shard_for(dst_key)
+					if src_shard != dst_shard:
+						self.tx_history.append((src_key, dst_key, src_shard, dst_shard))
+
 				# Pick cluster leader target
 				shard = shard_for(tx[0]) if len(tx) >= 1 else 1
 				leader_proc = self.cluster_leaders.get(shard)
@@ -318,7 +331,7 @@ class Driver(process):
 
 			if self.prompt_balance and not getattr(self, 'skip_next_set', False):
 				while True:
-					prompt = f"Set {set_id} done. Commands: PrintBalance(ID), 'next'/'n' continue, 'skip' skip next set, 'q'/'exit' stop: "
+					prompt = f"Set {set_id} done. Commands: PrintBalance(ID), Reshard, 'next'/'n', 'skip', 'q'/'exit': "
 					output(prompt)
 					cmd = ''
 					try:
@@ -341,6 +354,9 @@ class Driver(process):
 						break
 					if cmd.lower() in ('next', 'n'):
 						break
+					if cmd.lower() == 'reshard':
+						self._do_reshard()
+						continue
 					if not cmd:
 						output("Please enter a command. Use 'next' or 'n' to continue.")
 						continue
@@ -399,6 +415,62 @@ class Driver(process):
 		else:
 			missing = [self.proc_to_name.get(p, str(p)) for p in targets]
 			output(f"PrintBalance({key_id}): missing replies from {missing}")
+
+	def _do_reshard():
+		"""Analyze tx_history, migrate high-affinity cross-shard keys, output triplets."""
+		if not self.tx_history:
+			output("Reshard: no cross-shard transactions recorded")
+			return
+
+		# Count frequency of (src_key, dst_key) pairs
+		from collections import Counter
+		pair_counts = Counter()
+		key_shard = {}  # key -> current shard
+		for src_key, dst_key, src_shard, dst_shard in self.tx_history:
+			pair_counts[(src_key, dst_key)] += 1
+			key_shard[src_key] = src_shard
+			key_shard[dst_key] = dst_shard
+
+		# Find most frequent cross-shard pair
+		if not pair_counts:
+			output("Reshard: []")
+			return
+
+		most_common = pair_counts.most_common(3)  # Top 3 pairs
+		moves = []
+
+		for (src_key, dst_key), count in most_common:
+			src_shard = key_shard.get(src_key, shard_for(src_key))
+			dst_shard = key_shard.get(dst_key, shard_for(dst_key))
+			if src_shard == dst_shard:
+				continue  # Already same shard
+			# Migrate the less-frequent key to the more-frequent key's shard
+			# For simplicity, migrate dst_key to src_shard
+			key_to_move = dst_key
+			from_shard = dst_shard
+			to_shard = src_shard
+
+			# Send migration request to source shard nodes
+			source_nodes = list(self.clusters.get(from_shard, set()))
+			dest_nodes = list(self.clusters.get(to_shard, set()))
+			if source_nodes and dest_nodes:
+				send(('MIGRATE_KEY', key_to_move, to_shard, dest_nodes), to=source_nodes)
+				moves.append((key_to_move, f"c{from_shard}", f"c{to_shard}"))
+				# Update dynamic shard map
+				self.dynamic_shard_map[key_to_move] = to_shard
+
+		self.reshard_moves = moves
+		time.sleep(0.5)  # Allow migration to complete
+
+		# Notify all nodes to print reshard events
+		send(('PRINT_RESHARD',), to=list(self.all_nodes))
+		time.sleep(0.2)
+
+		if moves:
+			triplets = ", ".join([f"({k}, {s}, {d})" for k, s, d in moves])
+			output(f"Reshard: {triplets}")
+		else:
+			output("Reshard: []")
 
 
 # === Node ===
@@ -1131,6 +1203,32 @@ class Node(process):
 	def receive(msg=('GET_BALANCE', key_id, req_id, requester)):
 		bal = self.db.get(key_id, INITIAL_BALANCE)
 		send(('BALANCE_RESULT', req_id, self.node_name, bal), to=requester)
+
+	def receive(msg=('MIGRATE_KEY', key_id, dest_shard, dest_nodes)):
+		"""Migrate a key from this shard to another shard."""
+		if self.is_failed:
+			return
+		# Read current balance
+		bal = self.db.get(key_id, INITIAL_BALANCE)
+		# Record the migration event
+		src_shard = self.cluster_id
+		self.reshard_events.append((key_id, f"c{src_shard}", f"c{dest_shard}"))
+		# Delete from local DB (optional: keep a tombstone)
+		self.db[key_id] = 0  # Mark as migrated
+		# Send to destination nodes
+		send(('RECEIVE_KEY', key_id, bal, src_shard), to=dest_nodes)
+		log_info(f"{self.node_name} migrated key {key_id} (bal={bal}) to shard {dest_shard}")
+
+	def receive(msg=('RECEIVE_KEY', key_id, balance, source_shard)):
+		"""Receive a migrated key from another shard."""
+		if self.is_failed:
+			return
+		# Insert key with balance into local DB
+		self.db[key_id] = balance
+		self.modified_keys.add(key_id)
+		# Record the migration event
+		self.reshard_events.append((key_id, f"c{source_shard}", f"c{self.cluster_id}"))
+		log_info(f"{self.node_name} received key {key_id} (bal={balance}) from shard {source_shard}")
 
 	def receive(msg=('PRINT_RESHARD',)):
 		moves = getattr(self, 'reshard_events', []) or []
