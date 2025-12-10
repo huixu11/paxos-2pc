@@ -383,6 +383,20 @@ class Node(process):
 				# Drive any fully prepared-but-undecided 2PCs after leadership changes.
 				drive_pending_decisions()
 				for txid, meta in list(self.pending_2pc.items()):
+					# Retry PREPARE_TX to participants still pending
+					if meta.get('state') == 'WAIT_PREPARED':
+						participants = meta.get('participants', set())
+						ready = meta.get('participants_ready', set())
+						for shard in participants:
+							if shard in ready:
+								continue
+							last_sent = meta.get('last_prepare_sent', 0)
+							if now - last_sent >= PREPARE_RETRY_INTERVAL:
+								targets = self.cluster_map.get(shard, set())
+								if targets:
+									send(('PREPARE_TX', txid, self.tx_meta[txid]['tx'], self.cluster_id, meta.get('seq_p'), meta.get('seq_p')), to=targets)
+									meta['last_prepare_sent'] = now
+									self.pending_2pc[txid] = meta
 					if now - meta.get('ts', now) > TWO_PC_TIMEOUT and txid in self.tx_meta:
 						decision = 'ABORT'
 						seq_c = self.tx_meta[txid].get('commit_seq', self.tx_meta[txid].get('prepare_seq', self.next_seq))
@@ -723,10 +737,6 @@ class Node(process):
 		if self.is_failed:
 			return
 		if self.status != 'LEADER':
-			fresh_leader = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
-			if fresh_leader:
-				send(('CLIENT_TX', tx, txid, client), to=fresh_leader)
-				return
 			ensure_leader()
 			if self.status != 'LEADER':
 				self.pending_requests.add((txid, tx, client))
@@ -773,7 +783,7 @@ class Node(process):
 		propose_with_seq(seq_p, ('2PC_PREP', txid, tx, 'COORD'))
 		targets = self.cluster_map.get(shard_dst, set())
 		send(('PREPARE_TX', txid, tx, self.cluster_id, seq_p, seq_p), to=targets)
-		self.pending_2pc[txid] = {'state': 'WAIT_PREPARED', 'ts': time.time(), 'seq_p': seq_p}
+		self.pending_2pc[txid] = {'state': 'WAIT_PREPARED', 'ts': time.time(), 'seq_p': seq_p, 'participants': set(participants), 'participants_ready': set(), 'last_prepare_sent': time.time()}
 
 	def acquire_lock(key, txid):
 		holder = self.locks.get(key)
@@ -803,10 +813,6 @@ class Node(process):
 		if self.is_failed:
 			return
 		if self.status != 'LEADER':
-			fresh_leader = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
-			if fresh_leader:
-				send(('PREPARE_TX', txid, tx, coord_shard, seq_p, seq_c), to=fresh_leader)
-				return
 			self.backlog_prepares.append((txid, tx, coord_shard, seq_p, seq_c))
 			ensure_leader()
 			return
@@ -827,6 +833,8 @@ class Node(process):
 			return
 		meta.setdefault('prepared', {})['PART'] = True
 		self.tx_meta[txid] = meta
+		if txid in self.pending_2pc:
+			self.pending_2pc[txid].setdefault('participants_ready', set()).add(meta.get('participants', ())[0])
 		if self.status != 'LEADER':
 			if self.current_leader:
 				send(('PREPARED', txid), to=self.current_leader)
@@ -871,12 +879,8 @@ class Node(process):
 		if meta.get('decision'):
 			return
 		if self.status != 'LEADER':
-			fresh_leader = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
-			if fresh_leader:
-				send(('DECISION', txid, decision), to=fresh_leader)
-			else:
-				self.backlog_decisions.append((txid, decision))
-				ensure_leader()
+			self.backlog_decisions.append((txid, decision))
+			ensure_leader()
 			return
 		seq_c = meta.get('commit_seq', meta.get('prepare_seq', self.next_seq))
 		propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'PART'))
