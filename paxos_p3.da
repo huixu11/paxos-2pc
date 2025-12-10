@@ -14,11 +14,12 @@ def timeout(t: float):
 
 # === Configuration ===
 TIMEOUT = 3.0            # Base client/driver timeout
+TWO_PC_TIMEOUT = 2.5     # Internal 2PC wait (must be < client TIMEOUT)
 HEARTBEAT_INTERVAL = 0.4
 HEARTBEAT_TIMEOUT = 1.0
 ELECTION_TIMEOUT = 1.5   # Faster failover to fit client timeout
 PREPARE_BACKOFF = 0.5
-PREPARE_RETRY_INTERVAL = 0.5
+PREPARE_RETRY_INTERVAL = 0.25
 MAX_CANDIDATE_TIME = 2 * ELECTION_TIMEOUT
 ELECTION_JITTER = 0.4
 
@@ -307,7 +308,7 @@ class Node(process):
 				# Drive any fully prepared-but-undecided 2PCs after leadership changes.
 				drive_pending_decisions()
 				for txid, meta in list(self.pending_2pc.items()):
-					if now - meta.get('ts', now) > TIMEOUT and txid in self.tx_meta:
+					if now - meta.get('ts', now) > TWO_PC_TIMEOUT and txid in self.tx_meta:
 						decision = 'ABORT'
 						seq_c = self.tx_meta[txid].get('commit_seq', self.tx_meta[txid].get('prepare_seq', self.next_seq))
 						propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
