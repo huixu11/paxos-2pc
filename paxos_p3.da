@@ -271,6 +271,8 @@ class Node(process):
 		self.decision_outbox = {}
 		self.pending_2pc = {}
 		self.tx_client = {}
+		self.backlog_prepared = set()
+		self.backlog_decisions = []
 
 		self.new_view_messages = []
 
@@ -381,6 +383,18 @@ class Node(process):
 		self.new_view_messages.append(('NEW-VIEW', self.ballot_num, len(self.accept_log)))
 		if self.live_peers:
 			send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
+        
+		# Process any backlogged PREPARED/DECISION messages captured while leader was unknown
+		if self.backlog_prepared:
+			pending_prepared = list(self.backlog_prepared)
+			self.backlog_prepared.clear()
+			for txid in pending_prepared:
+				receive(('PREPARED', txid), from_=self)
+		if self.backlog_decisions:
+			pending_dec = list(self.backlog_decisions)
+			self.backlog_decisions = []
+			for txid, decision in pending_dec:
+				receive(('DECISION', txid, decision), from_=self)
 
 	# === Paxos message handlers ===
 	def receive(msg=('HEARTBEAT', b, leader_proc), from_=p):
@@ -682,6 +696,9 @@ class Node(process):
 		if self.status != 'LEADER':
 			if self.current_leader:
 				send(('PREPARED', txid), to=self.current_leader)
+			else:
+				self.backlog_prepared.add(txid)
+				ensure_leader()
 			return
 		if meta['prepared'].get('COORD') and not meta.get('decision'):
 			decision = 'COMMIT'
@@ -700,6 +717,9 @@ class Node(process):
 		if self.status != 'LEADER':
 			if self.current_leader:
 				send(('ABORT_TX', txid), to=self.current_leader)
+			else:
+				self.backlog_decisions.append((txid, 'ABORT'))
+				ensure_leader()
 			return
 		decision = 'ABORT'
 		seq_c = meta.get('commit_seq', self.next_seq)
@@ -720,6 +740,9 @@ class Node(process):
 			fresh_leader = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
 			if fresh_leader:
 				send(('DECISION', txid, decision), to=fresh_leader)
+			else:
+				self.backlog_decisions.append((txid, decision))
+				ensure_leader()
 			return
 		seq_c = meta.get('commit_seq', self.next_seq)
 		propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'PART'))
@@ -781,6 +804,8 @@ class Node(process):
 		self.decision_outbox = {}
 		self.pending_2pc = {}
 		self.tx_client = {}
+		self.backlog_prepared = set()
+		self.backlog_decisions = []
 		self.new_view_messages = []
 		self.status = 'LEADER' if self.is_initial_leader else 'FOLLOWER'
 		self.ballot_num = (1, self.node_name, self) if self.is_initial_leader else (0, self.node_name, self)
