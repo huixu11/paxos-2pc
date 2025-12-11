@@ -15,15 +15,15 @@ def timeout(t: float):
 	return True
 
 # === Configuration ===
-TIMEOUT = 3.0            # Base client/driver timeout (increased to ensure completion during failover)
-TWO_PC_TIMEOUT = 2.8     # Internal 2PC wait (must be < client TIMEOUT)
-HEARTBEAT_INTERVAL = 0.4
-HEARTBEAT_TIMEOUT = 1.0
-ELECTION_TIMEOUT = 1.5   # Faster failover to fit client timeout
-PREPARE_BACKOFF = 0.5
-PREPARE_RETRY_INTERVAL = 0.25
+TIMEOUT = 5.0            # Base client/driver timeout (increased to ensure completion during failover)
+TWO_PC_TIMEOUT = 4.5     # Internal 2PC wait (must be < client TIMEOUT)
+HEARTBEAT_INTERVAL = 0.3
+HEARTBEAT_TIMEOUT = 0.8
+ELECTION_TIMEOUT = 1.2   # Faster failover to fit client timeout
+PREPARE_BACKOFF = 0.3
+PREPARE_RETRY_INTERVAL = 0.15  # More aggressive retries
 MAX_CANDIDATE_TIME = 2 * ELECTION_TIMEOUT
-ELECTION_JITTER = 0.4
+ELECTION_JITTER = 0.3
 
 VERBOSE_LOG = False
 INITIAL_BALANCE = 10
@@ -776,6 +776,33 @@ class Node(process):
 							self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time(), 'client': client}
 					if client:
 						send(('TX_RESULT', txid, decision), to=client)
+
+	def drive_incomplete_2pc():
+		"""Recover incomplete 2PC transactions when becoming new leader.
+		Resend PREPARE_TX to participants that haven't responded yet."""
+		now = time.time()
+		for txid, meta in list(self.tx_meta.items()):
+			if not meta or meta.get('decision'):
+				continue
+			# Only handle transactions where we are coordinator (COORD is prepared)
+			if not meta.get('prepared', {}).get('COORD'):
+				continue
+			# If PART not yet prepared, resend PREPARE_TX
+			if not meta.get('prepared', {}).get('PART'):
+				tx = meta.get('tx')
+				if not tx:
+					continue
+				participants = meta.get('participants', ())
+				seq_p = meta.get('prepare_seq') or self.next_seq
+				for shard in participants:
+					targets = self.cluster_map.get(shard, set())
+					if targets:
+						output(f"DEBUG {self.node_name} drive_incomplete_2pc: resending PREPARE_TX txid={txid} to shard={shard}")
+						send(('PREPARE_TX', txid, tx, self.cluster_id, seq_p, seq_p), to=targets)
+				# Add to pending_2pc if not already there
+				if txid not in self.pending_2pc:
+					self.pending_2pc[txid] = {'state': 'WAIT_PREPARED', 'ts': now, 'seq_p': seq_p, 'participants': set(participants), 'participants_ready': set(), 'last_prepare_sent': now}
+
 	def handle_timer_expiry():
 		if self.status != 'FOLLOWER' or self.is_failed:
 			return
@@ -848,6 +875,10 @@ class Node(process):
 			self.backlog_prepares = []
 			for txid, tx, coord_shard, seq_p, seq_c in pending_preps:
 				send(('PREPARE_TX', txid, tx, coord_shard, seq_p, seq_c), to=self)
+		
+		# Recover any incomplete 2PC transactions as new leader
+		drive_incomplete_2pc()
+		drive_pending_decisions()
 
 	# === Paxos message handlers ===
 	def receive(msg=('HEARTBEAT', b, leader_proc), from_=p):
