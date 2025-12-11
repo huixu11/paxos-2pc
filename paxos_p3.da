@@ -1304,16 +1304,18 @@ class Node(process):
 			ensure_leader()
 			return
 		src, dst, amt = tx
-		output(f"DEBUG {self.node_name} receive PREPARE_TX txid={txid} from shard={coord_shard} seq_p={seq_p} live_cluster={self.live_cluster_size}")
+		# Use participant's own seq instead of coordinator's seq_p to ensure sequential execution
+		my_seq = self.next_seq
+		output(f"DEBUG {self.node_name} receive PREPARE_TX txid={txid} from shard={coord_shard} using local seq={my_seq} live_cluster={self.live_cluster_size}")
 		coord_targets = self.cluster_map.get(coord_shard, set())
 		if not acquire_lock(dst, txid):
 			output(f"DEBUG {self.node_name} PREPARE_TX txid={txid} lock failed for key={dst}, sending ABORT")
-			propose_with_seq(seq_p, ('2PC_PREP_ABORT', txid, tx, 'PART'))
+			propose(('2PC_PREP_ABORT', txid, tx, 'PART'))
 			send(('ABORT_TX', txid), to=coord_targets)
 			return
-		self.tx_meta[txid] = {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': seq_p, 'commit_seq': seq_p, 'client': None, 'participants': (self.cluster_id,), 'ts': time.time(), 'coord_shard': coord_shard}
-		output(f"DEBUG {self.node_name} PREPARE_TX txid={txid} calling propose_with_seq seq={seq_p}")
-		propose_with_seq(seq_p, ('2PC_PREP', txid, tx, 'PART'))
+		self.tx_meta[txid] = {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': my_seq, 'commit_seq': my_seq, 'client': None, 'participants': (self.cluster_id,), 'ts': time.time(), 'coord_shard': coord_shard}
+		output(f"DEBUG {self.node_name} PREPARE_TX txid={txid} calling propose seq={my_seq}")
+		propose(('2PC_PREP', txid, tx, 'PART'))
 
 	def receive(msg=('PREPARED', txid, tx_payload, coord_hint), from_=p):
 		if self.is_failed:
@@ -1409,10 +1411,8 @@ class Node(process):
 			self.backlog_decisions.append((txid, decision))
 			ensure_leader()
 			return
-		seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
-		if seq_c is None:
-			seq_c = self.next_seq
-		propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'PART'))
+		# Use participant's own seq to ensure sequential execution
+		propose(('2PC_DECISION', txid, decision, 'PART'))
 		maybe_reply_client(txid, decision)
 		send(('DECISION_ACK', txid), to=coord)
 
