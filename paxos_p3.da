@@ -294,10 +294,24 @@ class Driver(process):
 			send(('RESET',), to=list(self.all_nodes))
 			time.sleep(TIMEOUT * 0.2)
 
-			# Apply live set
+			# Apply live set - send live node set to each node for accurate peer tracking
+			live_procs_by_cluster = {}
+			for name in live_nodes:
+				proc = self.node_map.get(name)
+				if proc:
+					# Determine cluster from node name (n1-n3=c1, n4-n6=c2, n7-n9=c3 for 3x3)
+					node_idx = int(name[1:])
+					cluster_id = ((node_idx - 1) // CLUSTER_CONFIG['nodes_per_cluster']) + 1
+					if cluster_id not in live_procs_by_cluster:
+						live_procs_by_cluster[cluster_id] = set()
+					live_procs_by_cluster[cluster_id].add(proc)
+			
 			for name, proc in self.node_map.items():
 				if name in live_nodes:
-					send(('RECOVER',), to=proc)
+					node_idx = int(name[1:])
+					cluster_id = ((node_idx - 1) // CLUSTER_CONFIG['nodes_per_cluster']) + 1
+					cluster_live_procs = live_procs_by_cluster.get(cluster_id, set())
+					send(('RECOVER_WITH_PEERS', cluster_live_procs), to=proc)
 				else:
 					send(('FAIL',), to=proc)
 
@@ -577,7 +591,7 @@ class Driver(process):
 # === Node ===
 
 class Node(process):
-	def setup(node_name:str, cluster_id:int, peers:set, all_nodes:set, cluster_map:dict, initial_leader:bool, initial_leader_proc):
+	def setup(node_name:str, cluster_id:int, peers:set, all_nodes:set, cluster_map:dict, initial_leader:bool, initial_leader_proc, proc_to_name:dict):
 		self.node_name = node_name
 		self.cluster_id = cluster_id
 		self.peers = peers - {self}
@@ -585,6 +599,7 @@ class Node(process):
 		self.cluster_map = {k: set(v) for k, v in cluster_map.items()}
 		self.is_initial_leader = initial_leader
 		self.initial_leader_proc = initial_leader_proc
+		self.proc_to_name = proc_to_name  # Mapping from process to node name
 
 		self.status = 'LEADER' if initial_leader else 'FOLLOWER'
 		self.ballot_num = (1, node_name, self) if initial_leader else (0, node_name, self)
@@ -661,6 +676,8 @@ class Node(process):
 							send(('TX_RESULT', txid, desc), to=client)
 				# Drive any fully prepared-but-undecided 2PCs after leadership changes.
 				drive_pending_decisions()
+				# Also recover incomplete 2PCs (COORD prepared but PART not yet)
+				drive_incomplete_2pc()
 				for txid, meta in list(self.pending_2pc.items()):
 					# Retry PREPARE_TX to participants still pending
 					if meta.get('state') == 'WAIT_PREPARED':
@@ -814,13 +831,15 @@ class Node(process):
 		start_election()
 
 	def should_i_lead():
-		live_names = [getattr(p, 'node_name', str(p)) for p in self.live_peers] + [self.node_name]
+		live_names = [self.proc_to_name.get(p, str(p)) for p in self.live_peers] + [self.node_name]
 		return self.node_name == min(live_names)
 
 	def start_election():
 		if self.is_failed or self.status == 'CANDIDATE' or self.status == 'LEADER':
+			output(f"DEBUG {self.node_name} start_election: skipped (failed={self.is_failed}, status={self.status})")
 			return
 		if not should_i_lead():
+			output(f"DEBUG {self.node_name} start_election: not my turn (live_peers={[self.proc_to_name.get(p, str(p)) for p in self.live_peers]})")
 			self.last_leader_msg = time.time()
 			return
 		self.status = 'CANDIDATE'
@@ -830,32 +849,40 @@ class Node(process):
 		self.last_election_time = time.time()
 		self.candidate_start_time = time.time()
 		self.last_leader_msg = time.time()
+		output(f"DEBUG {self.node_name} start_election: becoming CANDIDATE, ballot={self.ballot_num[0]}, live_peers={len(self.live_peers)}")
 		if not self.live_peers:
 			# Single live node: self-elect immediately so progress continues.
+			output(f"DEBUG {self.node_name} start_election: no peers, self-electing")
 			become_leader()
 			return
 		if self.live_peers:
+			output(f"DEBUG {self.node_name} start_election: sending PREPARE to {len(self.live_peers)} peers")
 			send(('PREPARE', self.ballot_num), to=self.live_peers)
 
 # Conservative helper: follow known leader; if none, trigger election
 	def ensure_leader():
 		if self.status == 'LEADER':
 			return True
-		if self.current_leader and self.current_leader != self:
+		# If current_leader is in live_peers, wait for it; otherwise start election
+		if self.current_leader and self.current_leader != self and self.current_leader in self.live_peers:
 			return False
-		start_election()
+		# No valid leader known, start election
+		if self.status != 'CANDIDATE':
+			output(f"DEBUG {self.node_name} ensure_leader: no valid leader, starting election")
+			start_election()
 		return False
 
 	def become_leader():
 		self.status = 'LEADER'
 		self.leader = self
 		self.current_leader = self
-		self.leader_grace_until = time.time() + ELECTION_TIMEOUT
+		self.leader_grace_until = time.time() + ELECTION_TIMEOUT * 2  # Extended grace period
 		self.live_cluster_size = len(self.live_peers) + 1
 		key = (self.ballot_num[0], self.ballot_num[1])
 		for acc_log in self.promises.get(key, {}).values():
 			self.accept_log.update(acc_log)
 		self.new_view_messages.append(('NEW-VIEW', self.ballot_num, len(self.accept_log)))
+		output(f"DEBUG {self.node_name} become_leader: ballot={self.ballot_num[0]}, live_cluster_size={self.live_cluster_size}, backlog_prepares={len(self.backlog_prepares)}")
 		if self.live_peers:
 			send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
         
@@ -864,7 +891,10 @@ class Node(process):
 			pending_prepared = list(self.backlog_prepared)
 			self.backlog_prepared.clear()
 			for txid in pending_prepared:
-				send(('PREPARED', txid), to=self)
+				meta = self.tx_meta.get(txid, {})
+				tx = meta.get('tx')
+				coord_shard = meta.get('coord_shard')
+				send(('PREPARED', txid, tx, coord_shard), to=self)
 		if self.backlog_decisions:
 			pending_dec = list(self.backlog_decisions)
 			self.backlog_decisions = []
@@ -873,6 +903,7 @@ class Node(process):
 		if self.backlog_prepares:
 			pending_preps = list(self.backlog_prepares)
 			self.backlog_prepares = []
+			output(f"DEBUG {self.node_name} become_leader: replaying {len(pending_preps)} backlog PREPARE_TX")
 			for txid, tx, coord_shard, seq_p, seq_c in pending_preps:
 				send(('PREPARE_TX', txid, tx, coord_shard, seq_p, seq_c), to=self)
 		
@@ -897,7 +928,11 @@ class Node(process):
 			return
 		now = time.time()
 		self.last_prepare_received_time = now
-		if self.status == 'LEADER' and now < self.leader_grace_until:
+		# Extend grace period if we have active transactions
+		active_2pc = len(self.pending_2pc) > 0 or len(self.decision_outbox) > 0
+		grace_time = self.leader_grace_until if not active_2pc else now + ELECTION_TIMEOUT
+		if self.status == 'LEADER' and now < grace_time:
+			output(f"DEBUG {self.node_name} ignoring PREPARE from {self.proc_to_name.get(p, str(p))} during grace (active_2pc={active_2pc})")
 			return
 		if b >= self.ballot_num:
 			accept_prepare(b, p)
@@ -906,6 +941,8 @@ class Node(process):
 			self.buffered_prepare = (b, p)
 
 	def accept_prepare(b, proposer):
+		proposer_name = self.proc_to_name.get(proposer, str(proposer))
+		output(f"DEBUG {self.node_name} accept_prepare: accepting ballot {b[0]} from {proposer_name}")
 		self.ballot_num = b
 		self.status = 'FOLLOWER'
 		self.leader = proposer
@@ -927,6 +964,8 @@ class Node(process):
 			acc_log = set(acc_log)
 		if self.is_failed:
 			return
+		peer_name = self.proc_to_name.get(p, str(p))
+		output(f"DEBUG {self.node_name} receive(ACK) from {peer_name}: b_key={b_key}, my_key={my_key}, status={self.status}")
 		if self.status != 'CANDIDATE':
 			if b_key != my_key:
 				send(('PREPARE', self.ballot_num), to=p)
@@ -938,6 +977,7 @@ class Node(process):
 			self.promises[b_key] = {}
 		self.promises[b_key][p] = set(acc_log)
 		majority = (self.live_cluster_size // 2) + 1
+		output(f"DEBUG {self.node_name} ACK counted: promises={len(self.promises[b_key])}, majority={majority}")
 		if len(self.promises[b_key]) >= majority:
 			become_leader()
 
@@ -971,7 +1011,9 @@ class Node(process):
 		voters.add(node)
 		if self not in voters:
 			voters.add(self)
-		if len(voters) > self.live_cluster_size / 2:
+		needed = self.live_cluster_size / 2
+		if len(voters) > needed:
+			output(f"DEBUG {self.node_name} ACCEPTED majority reached: {len(voters)} > {needed} for seq={seq}")
 			existing = self.committed_log.get(seq)
 			if existing and is_prep(existing) and is_decision(val):
 				handle_commit(b, seq, val)
@@ -1218,17 +1260,27 @@ class Node(process):
 		self.pending_2pc[txid] = {'state': 'WAIT_PREPARED', 'ts': time.time(), 'seq_p': seq_p, 'participants': set(participants), 'participants_ready': set(), 'last_prepare_sent': time.time()}
 
 	def acquire_lock(key, txid):
-		holder = self.locks.get(key)
-		if holder and holder != txid:
-			return False
-		self.locks[key] = txid
+		holder_info = self.locks.get(key)
+		if holder_info:
+			holder_txid, lock_ts = holder_info if isinstance(holder_info, tuple) else (holder_info, 0)
+			if holder_txid and holder_txid != txid:
+				# Check if lock is stale (held too long)
+				now = time.time()
+				if lock_ts and (now - lock_ts) > TWO_PC_TIMEOUT:
+					# Stale lock - release it and continue
+					output(f"DEBUG {self.node_name} acquire_lock: releasing stale lock on key={key} held by txid={holder_txid}")
+					del self.locks[key]
+				else:
+					return False
+		self.locks[key] = (txid, time.time())
 		if key not in self.db:
 			self.db[key] = 10
 		return True
 
 	def release_locks(txid):
 		for k, v in list(self.locks.items()):
-			if v == txid:
+			holder_txid = v[0] if isinstance(v, tuple) else v
+			if holder_txid == txid:
 				del self.locks[k]
 
 	def record_wal(key, txid):
@@ -1247,24 +1299,27 @@ class Node(process):
 		if self.is_failed:
 			return
 		if self.status != 'LEADER':
+			output(f"DEBUG {self.node_name} PREPARE_TX txid={txid} deferred (status={self.status}, live_peers={len(self.live_peers)})")
 			self.backlog_prepares.append((txid, tx, coord_shard, seq_p, seq_c))
 			ensure_leader()
 			return
 		src, dst, amt = tx
-		output(f"DEBUG {self.node_name} receive PREPARE_TX txid={txid} from shard={coord_shard} seq_p={seq_p}")
+		output(f"DEBUG {self.node_name} receive PREPARE_TX txid={txid} from shard={coord_shard} seq_p={seq_p} live_cluster={self.live_cluster_size}")
 		coord_targets = self.cluster_map.get(coord_shard, set())
 		if not acquire_lock(dst, txid):
+			output(f"DEBUG {self.node_name} PREPARE_TX txid={txid} lock failed for key={dst}, sending ABORT")
 			propose_with_seq(seq_p, ('2PC_PREP_ABORT', txid, tx, 'PART'))
 			send(('ABORT_TX', txid), to=coord_targets)
 			return
 		self.tx_meta[txid] = {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': seq_p, 'commit_seq': seq_p, 'client': None, 'participants': (self.cluster_id,), 'ts': time.time(), 'coord_shard': coord_shard}
+		output(f"DEBUG {self.node_name} PREPARE_TX txid={txid} calling propose_with_seq seq={seq_p}")
 		propose_with_seq(seq_p, ('2PC_PREP', txid, tx, 'PART'))
 
 	def receive(msg=('PREPARED', txid, tx_payload, coord_hint), from_=p):
 		if self.is_failed:
 			return
 		# DistAlgo pattern matching already binds txid, tx_payload, coord_hint from the message
-		output(f"DEBUG {self.node_name} receive(PREPARED): txid={txid} from {getattr(p, 'node_name', p)} tx_known={tx_payload is not None}")
+		output(f"DEBUG {self.node_name} receive(PREPARED): txid={txid} from {self.proc_to_name.get(p, str(p))} tx_known={tx_payload is not None}")
 		meta = self.tx_meta.get(txid)
 		if not meta:
 			meta = {'tx': tx_payload, 'prepared': {}, 'decision': None, 'prepare_seq': None, 'commit_seq': None, 'client': None, 'participants': (), 'coord_shard': coord_hint}
@@ -1399,13 +1454,34 @@ class Node(process):
 		if self == self.initial_leader_proc:
 			start_election()
 
+	def receive(msg=('RECOVER_WITH_PEERS', cluster_live_procs)):
+		self.is_failed = False
+		self.last_leader_msg = time.time()
+		# Update live_peers to only include actually live nodes
+		old_size = self.live_cluster_size
+		self.live_peers = set(p for p in cluster_live_procs if p != self)
+		self.live_cluster_size = len(self.live_peers) + 1
+		output(f"DEBUG {self.node_name} RECOVER_WITH_PEERS: live_peers={len(self.live_peers)}, live_cluster_size={self.live_cluster_size} (was {old_size})")
+		for peer in self.live_peers:
+			send(('PEER_RECOVERED', self), to=peer)
+		
+		# Optimization: If we are the designated initial leader, start election immediately
+		if self == self.initial_leader_proc:
+			start_election()
+
 	def receive(msg=('PEER_FAILED', p), from_=_):
 		if self.is_failed:
 			return
+		peer_name = self.proc_to_name.get(p, str(p))
 		if p in self.live_peers:
 			self.live_peers.discard(p)
 			self.live_cluster_size = len(self.live_peers) + 1
+			output(f"DEBUG {self.node_name} PEER_FAILED: {peer_name} removed, live_cluster_size now {self.live_cluster_size}")
 			if p == self.current_leader and p != self:
+				# Clear current_leader so ensure_leader() will trigger election
+				self.current_leader = None
+				self.leader = None
+				output(f"DEBUG {self.node_name} leader {peer_name} failed, starting election")
 				start_election()
 
 	def receive(msg=('PEER_RECOVERED', p), from_=_):
@@ -1442,10 +1518,13 @@ class Node(process):
 		self.ballot_num = (1, self.node_name, self) if self.is_initial_leader else (0, self.node_name, self)
 		self.leader = self if self.is_initial_leader else self.initial_leader_proc
 		self.current_leader = self.leader
+		# Note: live_peers will be updated by RECOVER_WITH_PEERS message
 		self.live_peers = set(self.peers)
 		self.live_cluster_size = len(self.live_peers) + 1
 		self.last_leader_msg = time.time()
+		# Set grace period for initial leader to prevent early preemption
 		if self.is_initial_leader:
+			self.leader_grace_until = time.time() + ELECTION_TIMEOUT * 2
 			self.new_view_messages.append(('NEW-VIEW', self.ballot_num, len(self.accept_log)))
 
 	def receive(msg=('PRINT_DB', set_id)):
@@ -1594,13 +1673,16 @@ def main():
 
 	log_info(f"Leaders: {leader_names}")
 
+	# Create proc_to_name mapping
+	proc_to_name = {proc: name for name, proc in node_map.items()}
+
 	for i, node in enumerate(nodes_list):
 		name = node_names[i]
 		cid = (i // nodes_per_cluster) + 1
 		peers = cluster_map[cid]
 		initial_leader = (i % nodes_per_cluster) == 0  # First node in each cluster
 		initial_leader_proc = cluster_leaders[cid]
-		setup(node, (name, cid, peers, set(nodes_list), cluster_map, initial_leader, initial_leader_proc))
+		setup(node, (name, cid, peers, set(nodes_list), cluster_map, initial_leader, initial_leader_proc, proc_to_name))
 
 	start(nodes)
 
