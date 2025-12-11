@@ -1,0 +1,10 @@
+Set Number,Transactions,Live Nodes
+1,"(1001, 1002, 5)","[n1, n2, n3, n4, n5, n6, n7, n8, n9]"
+,"(1001, eventual)",
+,"(1001, linearizable)",
+,"(1003, 1004, 3, eventual)",
+,"(1003, ryw)",
+2,"(3001, 3002, 2)","[n1, n2, n3, n4, n5, n6, n7, n8, n9]"
+,"(3001, eventual)",
+,"(6001, 6002, 1)",
+,"(6001, ryw)",
