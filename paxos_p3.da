@@ -32,7 +32,7 @@ INITIAL_BALANCE = 10
 # === Logging Helpers ===
 def _emit(msg:str):
 	try:
-		# output(msg)
+		output(msg)
 	except Exception:
 		print(msg)
 
@@ -417,7 +417,7 @@ class Driver(process):
 			avg_lat = (lat_sum / total) if total else 0.0
 			log_info(f"Set {set_id} throughput={throughput:.2f} tx/s avg_lat={avg_lat:.3f}s count={total}")
 			self.stats[set_id] = {'throughput': throughput, 'avg_lat': avg_lat, 'count': total}
-			# output(f"Set {set_id} throughput={throughput:.2f} avg_lat={avg_lat:.3f}s count={total}")
+			output(f"Set {set_id} throughput={throughput:.2f} avg_lat={avg_lat:.3f}s count={total}")
 
 			send(('PRINT_DB', set_id), to=list(self.all_nodes))
 			send(('PRINT_VIEW', set_id), to=list(self.all_nodes))
@@ -426,7 +426,7 @@ class Driver(process):
 			if self.prompt_balance and not getattr(self, 'skip_next_set', False):
 				while True:
 					prompt = f"Set {set_id} done. Commands: PrintBalance(ID), Reshard, 'next'/'n', 'skip', 'q'/'exit': "
-					# output(prompt)
+					output(prompt)
 					cmd = ''
 					try:
 						cmd = input().strip()
@@ -438,7 +438,7 @@ class Driver(process):
 							_sys.stdin = _fin
 							cmd = input().strip()
 						except Exception:
-							# output("PROMPT_BALANCE: no stdin available, skipping")
+							output("PROMPT_BALANCE: no stdin available, skipping")
 							cmd = ''
 					if cmd.lower() in ('q', 'exit'):
 						send(('STOP',), to=list(self.all_nodes))
@@ -452,7 +452,7 @@ class Driver(process):
 						self._do_reshard()
 						continue
 					if not cmd:
-						# output("Please enter a command. Use 'next' or 'n' to continue.")
+						output("Please enter a command. Use 'next' or 'n' to continue.")
 						continue
 					to_run = []
 					payload = cmd.replace('PrintBalance', '').replace('(', '').replace(')', '')
@@ -486,11 +486,11 @@ class Driver(process):
 
 	def receive(msg=('PRINT_PERF',)):
 		if not self.stats:
-			# output("Performance: []")
+			output("Performance: []")
 			return
 		for sid in sorted(self.stats.keys()):
 			stat = self.stats[sid]
-			# output(f"Set {sid} throughput={stat['throughput']:.2f} avg_lat={stat['avg_lat']:.3f}s count={stat['count']}")
+			output(f"Set {sid} throughput={stat['throughput']:.2f} avg_lat={stat['avg_lat']:.3f}s count={stat['count']}")
 
 	def receive(msg=('PRINT_BALANCE', key_id)):
 		self._print_balance(key_id)
@@ -499,7 +499,7 @@ class Driver(process):
 		shard = shard_for(key_id)
 		targets = list(self.clusters.get(shard, set()))
 		if not targets:
-			# output(f"PrintBalance({key_id}): []")
+			output(f"PrintBalance({key_id}): []")
 			return
 		req_id = (key_id, time.time())
 		self.balance_responses[req_id] = {}
@@ -512,15 +512,15 @@ class Driver(process):
 		results = self.balance_responses.pop(req_id, {})
 		ordered = [f"{name} : {results.get(name, '?')}" for name in sorted(results.keys())]
 		if ordered:
-			# output(f"PrintBalance({key_id}): {', '.join(ordered)}")
+			output(f"PrintBalance({key_id}): {', '.join(ordered)}")
 		else:
 			missing = [self.proc_to_name.get(p, str(p)) for p in targets]
-			# output(f"PrintBalance({key_id}): missing replies from {missing}")
+			output(f"PrintBalance({key_id}): missing replies from {missing}")
 
 	def _do_reshard():
 		"""Analyze tx_history, migrate high-affinity cross-shard keys, output triplets."""
 		if not self.tx_history:
-			# output("Reshard: no cross-shard transactions recorded")
+			output("Reshard: no cross-shard transactions recorded")
 			return
 
 		# Count frequency of (src_key, dst_key) pairs
@@ -534,7 +534,7 @@ class Driver(process):
 
 		# Find most frequent cross-shard pair
 		if not pair_counts:
-			# output("Reshard: []")
+			output("Reshard: []")
 			return
 
 		most_common = pair_counts.most_common(3)  # Top 3 pairs
@@ -569,9 +569,9 @@ class Driver(process):
 
 		if moves:
 			triplets = ", ".join([f"({k}, {s}, {d})" for k, s, d in moves])
-			# output(f"Reshard: {triplets}")
+			output(f"Reshard: {triplets}")
 		else:
-			# output("Reshard: []")
+			output("Reshard: []")
 
 
 # === Node ===
@@ -691,12 +691,24 @@ class Node(process):
 					if info.get('decision_received'):
 						del self.pending_prepared_outbox[txid]
 						continue
+					# Stop retrying if transaction is too old (beyond 2PC timeout)
+					# Use last_sent as fallback if entry_ts missing, or treat as expired
+					entry_ts = info.get('entry_ts') or info.get('last_sent') or 0
+					if entry_ts == 0 or (now - entry_ts > TWO_PC_TIMEOUT + 1.0):
+						del self.pending_prepared_outbox[txid]
+						continue
+					# Limit max retries to prevent message flood
+					retry_count = info.get('retry_count', 0)
+					if retry_count >= 10:
+						del self.pending_prepared_outbox[txid]
+						continue
 					if now - info.get('last_sent', 0) >= PREPARE_RETRY_INTERVAL:
 						coord_shard = info.get('coord_shard')
 						targets = self.cluster_map.get(coord_shard, set())
 						if targets:
 							send(('PREPARED', txid, info.get('tx'), coord_shard), to=targets)
 							self.pending_prepared_outbox[txid]['last_sent'] = now
+							self.pending_prepared_outbox[txid]['retry_count'] = retry_count + 1
 			elif self.status == 'FOLLOWER':
 				old = self.last_leader_msg
 				jitter = random.uniform(0, ELECTION_JITTER)
@@ -707,6 +719,13 @@ class Node(process):
 					pass
 				elif timeout(to_wait):
 					handle_timer_expiry()
+				# Clean up stale pending_prepared_outbox entries (FOLLOWERs shouldn't have active retries)
+				now = time.time()
+				for txid in list(self.pending_prepared_outbox.keys()):
+					info = self.pending_prepared_outbox.get(txid, {})
+					entry_ts = info.get('entry_ts') or info.get('last_sent') or 0
+					if entry_ts == 0 or (now - entry_ts > TWO_PC_TIMEOUT + 1.0):
+						del self.pending_prepared_outbox[txid]
 				# Periodically replay backlog queues even as follower to avoid loss
 				if self.backlog_prepares:
 					pending_preps = list(self.backlog_prepares)
@@ -717,7 +736,10 @@ class Node(process):
 					pending_prepared = list(self.backlog_prepared)
 					self.backlog_prepared.clear()
 					for txid in pending_prepared:
-						send(('PREPARED', txid), to=self)
+						meta = self.tx_meta.get(txid, {})
+						tx = meta.get('tx')
+						coord_shard = meta.get('coord_shard')
+						send(('PREPARED', txid, tx, coord_shard), to=self)
 				if self.backlog_decisions:
 					pending_dec = list(self.backlog_decisions)
 					self.backlog_decisions = []
@@ -743,6 +765,8 @@ class Node(process):
 			if meta.get('prepared', {}).get('COORD') and meta.get('prepared', {}).get('PART'):
 					decision = 'COMMIT'
 					seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
+					if seq_c is None:
+						seq_c = self.next_seq
 					propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
 					client = meta.get('client')
 					for shard in meta.get('participants', ()): 
@@ -1006,13 +1030,15 @@ class Node(process):
 			if coord_shard:
 				targets = self.cluster_map.get(coord_shard, set())
 				if targets:
-					# output(f"DEBUG {self.node_name} apply_prepare_entry: sending PREPARED txid={txid} to coord_shard={coord_shard} ({len(targets)} targets)")
+					output(f"DEBUG {self.node_name} apply_prepare_entry: sending PREPARED txid={txid} to coord_shard={coord_shard} ({len(targets)} targets)")
 					send(('PREPARED', txid, tx, coord_shard), to=targets)
 					# Store for retry if DECISION not received
-					self.pending_prepared_outbox[txid] = {'coord_shard': coord_shard, 'tx': tx, 'last_sent': time.time(), 'decision_received': False}
+					self.pending_prepared_outbox[txid] = {'coord_shard': coord_shard, 'tx': tx, 'last_sent': time.time(), 'decision_received': False, 'entry_ts': time.time()}
 		if role == 'COORD' and self.status == 'LEADER' and meta['prepared'].get('PART') and not meta.get('decision'):
 			decision = 'COMMIT'
-			seq_c = meta.get('commit_seq', meta.get('prepare_seq', self.next_seq))
+			seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
+			if seq_c is None:
+				seq_c = self.next_seq
 			propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
 			for shard in meta.get('participants', ()): 
 				targets = self.cluster_map.get(shard, set())
@@ -1056,6 +1082,7 @@ class Node(process):
 	def receive(msg=('CLIENT_TX', tx, txid, client), from_=sender):
 		if self.is_failed:
 			return
+		output(f"DEBUG {self.node_name} receive(CLIENT_TX): txid={txid} tx={tx} status={self.status}")
 		if self.status != 'LEADER':
 			ensure_leader()
 			if self.status != 'LEADER':
@@ -1155,7 +1182,7 @@ class Node(process):
 		propose_with_seq(seq_p, ('2PC_PREP', txid, (src, dst, amt), 'COORD'))
 		targets = self.cluster_map.get(shard_dst, set())
 		if targets:
-			# output(f"DEBUG {self.node_name} send PREPARE_TX txid={txid} to shard={shard_dst} targets={len(targets)}")
+			output(f"DEBUG {self.node_name} send PREPARE_TX txid={txid} to shard={shard_dst} targets={len(targets)}")
 			send(('PREPARE_TX', txid, (src, dst, amt), self.cluster_id, seq_p, seq_p), to=targets)
 		self.pending_2pc[txid] = {'state': 'WAIT_PREPARED', 'ts': time.time(), 'seq_p': seq_p, 'participants': set(participants), 'participants_ready': set(), 'last_prepare_sent': time.time()}
 
@@ -1193,7 +1220,7 @@ class Node(process):
 			ensure_leader()
 			return
 		src, dst, amt = tx
-		# output(f"DEBUG {self.node_name} receive PREPARE_TX txid={txid} from shard={coord_shard} seq_p={seq_p}")
+		output(f"DEBUG {self.node_name} receive PREPARE_TX txid={txid} from shard={coord_shard} seq_p={seq_p}")
 		coord_targets = self.cluster_map.get(coord_shard, set())
 		if not acquire_lock(dst, txid):
 			propose_with_seq(seq_p, ('2PC_PREP_ABORT', txid, tx, 'PART'))
@@ -1205,11 +1232,8 @@ class Node(process):
 	def receive(msg=('PREPARED', txid, tx_payload, coord_hint), from_=p):
 		if self.is_failed:
 			return
-		# Unpack optional payloads
-		txid = msg[1]
-		tx_payload = msg[2] if len(msg) > 2 else None
-		coord_hint = msg[3] if len(msg) > 3 else None
-		# output(f"DEBUG {self.node_name} receive(PREPARED): txid={txid} from {getattr(p, 'node_name', p)} tx_known={tx_payload is not None}")
+		# DistAlgo pattern matching already binds txid, tx_payload, coord_hint from the message
+		output(f"DEBUG {self.node_name} receive(PREPARED): txid={txid} from {getattr(p, 'node_name', p)} tx_known={tx_payload is not None}")
 		meta = self.tx_meta.get(txid)
 		if not meta:
 			meta = {'tx': tx_payload, 'prepared': {}, 'decision': None, 'prepare_seq': None, 'commit_seq': None, 'client': None, 'participants': (), 'coord_shard': coord_hint}
@@ -1221,7 +1245,7 @@ class Node(process):
 			return
 		meta.setdefault('prepared', {})['PART'] = True
 		self.tx_meta[txid] = meta
-		# output(f"DEBUG {self.node_name} receive(PREPARED): after update, prepared={meta['prepared']}, status={self.status}")
+		output(f"DEBUG {self.node_name} receive(PREPARED): after update, prepared={meta['prepared']}, status={self.status}")
 		# If we are the coordinator shard leader but haven't yet marked COORD (e.g., PREPARED arrived before our own 2PC_PREP applied), fill it now once tx is known.
 		if self.status == 'LEADER' and not meta['prepared'].get('COORD'):
 			tx = meta.get('tx')
@@ -1232,9 +1256,8 @@ class Node(process):
 		if txid in self.pending_2pc and participants:
 			self.pending_2pc[txid].setdefault('participants_ready', set()).add(next(iter(participants)))
 		coord_shard = meta.get('coord_shard')
-		coord_targets = self.cluster_map.get(coord_shard, set()) if coord_shard else set()
-		if coord_targets:
-			send(('PREPARED', txid, meta.get('tx'), coord_shard), to=coord_targets)
+		# DO NOT unconditionally re-broadcast PREPARED - this causes message amplification
+		# The PREPARED was already sent by apply_prepare_entry when the participant prepared
 		if self.status != 'LEADER':
 			fresh = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
 			if not fresh:
@@ -1244,6 +1267,8 @@ class Node(process):
 		if meta['prepared'].get('COORD') and not meta.get('decision'):
 			decision = 'COMMIT'
 			seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
+			if seq_c is None:
+				seq_c = self.next_seq
 			propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
 			participant_shards = meta.get('participants', ())
 			client = meta.get('client')
@@ -1299,6 +1324,8 @@ class Node(process):
 			ensure_leader()
 			return
 		seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
+		if seq_c is None:
+			seq_c = self.next_seq
 		propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'PART'))
 		maybe_reply_client(txid, decision)
 		send(('DECISION_ACK', txid), to=coord)
@@ -1392,26 +1419,26 @@ class Node(process):
 
 	def receive(msg=('PRINT_DB', set_id)):
 		if not self.modified_keys:
-			# output(f"Set {set_id} {self.node_name} DB: []")
+			output(f"Set {set_id} {self.node_name} DB: []")
 			return
 		pairs = []
 		for k in sorted(self.modified_keys):
 			pairs.append(f"{k}:{self.db.get(k, INITIAL_BALANCE)}")
 		changed = ", ".join(pairs)
-		# output(f"Set {set_id} {self.node_name} DB: {changed}")
+		output(f"Set {set_id} {self.node_name} DB: {changed}")
 
 	def receive(msg=('PRINT_VIEW', set_id)):
 		if not self.new_view_messages:
-			# output(f"Set {set_id} {self.node_name} View: []")
+			output(f"Set {set_id} {self.node_name} View: []")
 			return
 		for tag, ballot, log_len in self.new_view_messages:
 			b_round = ballot[0] if isinstance(ballot, tuple) and len(ballot) > 0 else ballot
 			b_leader = ballot[1] if isinstance(ballot, tuple) and len(ballot) > 1 else ''
-			# output(f"Set {set_id} {self.node_name} View: {tag} {b_round} {b_leader} {log_len}")
+			output(f"Set {set_id} {self.node_name} View: {tag} {b_round} {b_leader} {log_len}")
 
 	def receive(msg=('PRINT_BALANCE', key_id)):
 		bal = self.db.get(key_id, INITIAL_BALANCE)
-		# output(f"{self.node_name} : {bal}")
+		output(f"{self.node_name} : {bal}")
 
 	def receive(msg=('GET_BALANCE', key_id, req_id, requester)):
 		bal = self.db.get(key_id, INITIAL_BALANCE)
@@ -1445,7 +1472,7 @@ class Node(process):
 
 	def receive(msg=('PRINT_RESHARD',)):
 		moves = getattr(self, 'reshard_events', []) or []
-		# output(f"{self.node_name} RESHARD: {moves}")
+		output(f"{self.node_name} RESHARD: {moves}")
 
 	def receive(msg=('STOP',)):
 		self.shutdown = True
