@@ -688,10 +688,44 @@ class Driver(process):
 
 		# Build moves: keys whose shard changed
 		moves = []
+		used_keys = set()
 		for k, new_sid in assign.items():
 			old_sid = shard_for(k)
 			if new_sid != old_sid:
 				moves.append((k, f"c{old_sid}", f"c{new_sid}", old_sid, new_sid))
+				used_keys.add(k)
+
+		# Fallback: if the local-improvement heuristic found no move, try a small number of
+		# high-impact cross-shard edges (still respecting balance). This avoids surprising "[]"
+		# for workloads that clearly have many cross-shard transfers.
+		if not moves:
+			top_edges = edge_w.most_common(20)
+			for (a, b), w in top_edges:
+				sa = shard_for(a)
+				sb = shard_for(b)
+				if sa == sb:
+					continue
+				# Try moving one endpoint to the other's shard.
+				# Prefer moving a key that keeps balance constraints satisfied.
+				cands = [(a, sa, sb), (b, sb, sa)]
+				best = None
+				for key, from_sid, to_sid in cands:
+					if key in used_keys:
+						continue
+					if sizes.get(to_sid, 0) + 1 > target + slack:
+						continue
+					if sizes.get(from_sid, 0) - 1 < target - slack:
+						continue
+					best = (key, from_sid, to_sid)
+					break
+				if best:
+					key, from_sid, to_sid = best
+					moves.append((key, f"c{from_sid}", f"c{to_sid}", from_sid, to_sid))
+					used_keys.add(key)
+					sizes[from_sid] = sizes.get(from_sid, 0) - 1
+					sizes[to_sid] = sizes.get(to_sid, 0) + 1
+				if len(moves) >= 5:
+					break
 
 		if not moves:
 			output("Reshard: []")
@@ -705,15 +739,20 @@ class Driver(process):
 				send(('MIGRATE_KEY', k, new_sid, dest_nodes), to=source_nodes)
 				SHARD_OVERRIDES[k] = new_sid
 
-		# Broadcast new overrides so future routing uses the updated mapping
-		send(('UPDATE_SHARD_OVERRIDES', dict(SHARD_OVERRIDES)), to=list(self.all_nodes))
+		# Broadcast new overrides so future routing uses the updated mapping.
+		# IMPORTANT: send deltas in chunks to avoid DA MessageTooBigException.
+		chunk = {}
+		CHUNK_SIZE = 200
+		for k, _s, _d, _old_sid, new_sid in moves:
+			chunk[int(k)] = int(new_sid)
+			if len(chunk) >= CHUNK_SIZE:
+				send(('UPDATE_SHARD_OVERRIDES_DELTA', dict(chunk)), to=list(self.all_nodes))
+				chunk = {}
+		if chunk:
+			send(('UPDATE_SHARD_OVERRIDES_DELTA', dict(chunk)), to=list(self.all_nodes))
 
 		self.reshard_moves = [(k, s, d) for (k, s, d, _o, _n) in moves]
 		time.sleep(0.3)
-
-		# Notify all nodes to print reshard events
-		send(('PRINT_RESHARD',), to=list(self.all_nodes))
-		time.sleep(0.1)
 
 		triplets = ", ".join([f"({k}, {s}, {d})" for (k, s, d, _o, _n) in moves])
 		output(f"Reshard: {triplets}")
@@ -1739,6 +1778,18 @@ class Node(process):
 				SHARD_OVERRIDES[int(k)] = int(sid)
 		except Exception:
 			# Best-effort; ignore malformed override maps.
+			return
+
+	def receive(msg=('UPDATE_SHARD_OVERRIDES_DELTA', delta)):
+		"""Apply a delta update to local dynamic shard mapping (offline resharding)."""
+		if self.is_failed:
+			return
+		try:
+			if not isinstance(delta, dict):
+				return
+			for k, sid in delta.items():
+				SHARD_OVERRIDES[int(k)] = int(sid)
+		except Exception:
 			return
 
 	def receive(msg=('PRINT_DB', set_id)):
