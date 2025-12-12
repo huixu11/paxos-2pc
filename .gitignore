@@ -1,0 +1,5 @@
+*.pdf
+# *.log
+.claude
+__pycache__
+distalgo

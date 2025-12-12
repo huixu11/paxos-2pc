@@ -150,7 +150,11 @@ def shard_for(key:int):
 
 def shard_bounds(shard_id:int):
 	"""Get key range for a shard using configured shard map."""
-	return CLUSTER_CONFIG['shard_map'].get(shard_id, (1, 3000))
+	# Fallback uses configured total_keys for safety under custom cluster counts.
+	total = CLUSTER_CONFIG.get('total_keys', 9000)
+	keys_per = max(1, total // max(1, CLUSTER_CONFIG.get('num_clusters', 3)))
+	fallback = (1, keys_per)
+	return CLUSTER_CONFIG['shard_map'].get(shard_id, fallback)
 
 
 class PersistentStore:
@@ -797,13 +801,14 @@ class Node(process):
 				for txid, info in list(self.decision_outbox.items()):
 					if now - info.get('last_sent', 0) >= PREPARE_RETRY_INTERVAL:
 						desc = info.get('decision')
+						client_reply = info.get('client_reply', desc)
 						targets = info.get('targets', set())
 						if targets:
 							send(('DECISION', txid, desc), to=targets)
 						self.decision_outbox[txid]['last_sent'] = now
 						client = info.get('client')
 						if client:
-							send(('TX_RESULT', txid, desc), to=client)
+							send(('TX_RESULT', txid, client_reply), to=client)
 				# Drive any fully prepared-but-undecided 2PCs after leadership changes.
 				drive_pending_decisions()
 				# Also recover incomplete 2PCs (COORD prepared but PART not yet)
@@ -853,7 +858,7 @@ class Node(process):
 						coord_shard = info.get('coord_shard')
 						targets = self.cluster_map.get(coord_shard, set())
 						if targets:
-							send(('PREPARED', txid, info.get('tx'), coord_shard), to=targets)
+							send(('PREPARED', txid, info.get('tx'), coord_shard, info.get('part_write') or {}), to=targets)
 							self.pending_prepared_outbox[txid]['last_sent'] = now
 							self.pending_prepared_outbox[txid]['retry_count'] = retry_count + 1
 			elif self.status == 'FOLLOWER':
@@ -920,9 +925,18 @@ class Node(process):
 						targets = self.cluster_map.get(shard, set())
 						if targets:
 							send(('DECISION', txid, decision), to=targets)
-							self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time(), 'client': client}
+							reply = decision
+							tx = meta.get('tx')
+							if decision == 'COMMIT' and tx and len(tx) >= 3:
+								src, dst, _amt = tx[0], tx[1], tx[2]
+								write_info = {src: self.db.get(src, INITIAL_BALANCE)}
+								pw = meta.get('part_write') if isinstance(meta.get('part_write'), dict) else {}
+								for k, v in (pw or {}).items():
+									write_info[int(k)] = v
+								reply = ('COMMIT', write_info)
+							self.decision_outbox[txid] = {'decision': decision, 'client_reply': reply, 'targets': set(targets), 'last_sent': time.time(), 'client': client}
 					if client:
-						send(('TX_RESULT', txid, decision), to=client)
+						send(('TX_RESULT', txid, reply), to=client)
 
 	def drive_incomplete_2pc():
 		"""Recover incomplete 2PC transactions when becoming new leader.
@@ -1248,9 +1262,10 @@ class Node(process):
 				targets = self.cluster_map.get(coord_shard, set())
 				if targets:
 					log_debug(f"{self.node_name} apply_prepare_entry: sending PREPARED txid={txid} to coord_shard={coord_shard} ({len(targets)} targets)")
-					send(('PREPARED', txid, tx, coord_shard), to=targets)
+					part_write = {dst: self.db.get(dst, INITIAL_BALANCE)} if commit_allowed else {}
+					send(('PREPARED', txid, tx, coord_shard, part_write), to=targets)
 					# Store for retry if DECISION not received
-					self.pending_prepared_outbox[txid] = {'coord_shard': coord_shard, 'tx': tx, 'last_sent': time.time(), 'decision_received': False, 'entry_ts': time.time()}
+					self.pending_prepared_outbox[txid] = {'coord_shard': coord_shard, 'tx': tx, 'part_write': part_write, 'last_sent': time.time(), 'decision_received': False, 'entry_ts': time.time()}
 		if role == 'COORD' and self.status == 'LEADER' and meta['prepared'].get('PART') and not meta.get('decision'):
 			decision = 'COMMIT'
 			seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
@@ -1293,7 +1308,18 @@ class Node(process):
 		meta = self.tx_meta.get(txid)
 		client = meta.get('client') if meta else None
 		if client:
-			send(('TX_RESULT', txid, decision), to=client)
+			reply = decision
+			if decision == 'COMMIT' and meta and meta.get('tx'):
+				tx = meta.get('tx')
+				if isinstance(tx, tuple) and len(tx) >= 3:
+					src, dst, _amt = tx[0], tx[1], tx[2]
+					write_info = {src: self.db.get(src, INITIAL_BALANCE)}
+					pw = meta.get('part_write') if isinstance(meta.get('part_write'), dict) else {}
+					for k, v in (pw or {}).items():
+						write_info[int(k)] = v
+					reply = ('COMMIT', write_info)
+			self.client_replies[txid] = reply
+			send(('TX_RESULT', txid, reply), to=client)
 
 	# === 2PC Handlers ===
 	def receive(msg=('CLIENT_TX', tx, txid, client), from_=sender):
@@ -1468,18 +1494,25 @@ class Node(process):
 		log_debug(f"{self.node_name} PREPARE_TX txid={txid} calling propose seq={my_seq}")
 		propose(('2PC_PREP', txid, tx, 'PART'))
 
+	# Backward compatible (older form without part_write)
 	def receive(msg=('PREPARED', txid, tx_payload, coord_hint), from_=p):
+		receive(('PREPARED', txid, tx_payload, coord_hint, {}), from_=p)
+
+	def receive(msg=('PREPARED', txid, tx_payload, coord_hint, part_write), from_=p):
 		if self.is_failed:
 			return
 		# DistAlgo pattern matching already binds txid, tx_payload, coord_hint from the message
 		log_debug(f"{self.node_name} receive(PREPARED): txid={txid} from {self.proc_to_name.get(p, str(p))} tx_known={tx_payload is not None}")
 		meta = self.tx_meta.get(txid)
 		if not meta:
-			meta = {'tx': tx_payload, 'prepared': {}, 'decision': None, 'prepare_seq': None, 'commit_seq': None, 'client': None, 'participants': (), 'coord_shard': coord_hint}
+			meta = {'tx': tx_payload, 'prepared': {}, 'decision': None, 'prepare_seq': None, 'commit_seq': None, 'client': None, 'participants': (), 'coord_shard': coord_hint, 'part_write': {}}
 		if tx_payload and not meta.get('tx'):
 			meta['tx'] = tx_payload
 		if coord_hint and not meta.get('coord_shard'):
 			meta['coord_shard'] = coord_hint
+		# Store participant write info (dst balance) for RYW/response
+		if isinstance(part_write, dict) and part_write:
+			meta['part_write'] = dict(part_write)
 		if meta.get('decision'):
 			return
 		meta.setdefault('prepared', {})['PART'] = True
@@ -1514,9 +1547,20 @@ class Node(process):
 			for shard in participant_shards:
 				targets = self.cluster_map.get(shard, set())
 				send(('DECISION', txid, decision), to=targets)
-				self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time(), 'client': client}
+				# For client RYW cache: include written balances when committing
+				reply = decision
+				if decision == 'COMMIT':
+					tx = meta.get('tx')
+					if tx and len(tx) >= 3:
+						src, dst, _amt = tx[0], tx[1], tx[2]
+						write_info = {src: self.db.get(src, INITIAL_BALANCE)}
+						pw = meta.get('part_write') if isinstance(meta.get('part_write'), dict) else {}
+						for k, v in (pw or {}).items():
+							write_info[int(k)] = v
+						reply = ('COMMIT', write_info)
+				self.decision_outbox[txid] = {'decision': decision, 'client_reply': reply, 'targets': set(targets), 'last_sent': time.time(), 'client': client}
 			if client:
-				send(('TX_RESULT', txid, decision), to=client)
+				send(('TX_RESULT', txid, reply), to=client)
 
 	def receive(msg=('ABORT_TX', txid), from_=p):
 		if self.is_failed:

@@ -15,14 +15,24 @@ import math
 from typing import List, Tuple, Optional
 
 
-# Shard boundaries (matching paxos_p3.da)
-SHARDS = {
-    1: (1, 3000),
-    2: (3001, 6000),
-    3: (6001, 9000),
-}
+def generate_shard_map(num_clusters: int, total_keys: int) -> dict:
+    """Match paxos_p3.da range partitioning."""
+    keys_per_shard = total_keys // num_clusters
+    shard_map = {}
+    for i in range(1, num_clusters + 1):
+        lo = (i - 1) * keys_per_shard + 1
+        hi = i * keys_per_shard if i < num_clusters else total_keys
+        shard_map[i] = (lo, hi)
+    return shard_map
 
-ALL_NODES = "[n1, n2, n3, n4, n5, n6, n7, n8, n9]"
+
+def generate_nodes(num_clusters: int, nodes_per_cluster: int) -> list:
+    total_nodes = num_clusters * nodes_per_cluster
+    return [f"n{i}" for i in range(1, total_nodes + 1)]
+
+
+def all_nodes_str(nodes: list) -> str:
+    return "[" + ", ".join(nodes) + "]"
 
 
 class BenchmarkGenerator:
@@ -34,6 +44,9 @@ class BenchmarkGenerator:
         cross_shard_percent: float = 0.0,
         skew: float = 0.0,
         num_transactions: int = 100,
+        num_clusters: int = 3,
+        nodes_per_cluster: int = 3,
+        total_keys: int = 9000,
         seed: Optional[int] = None,
     ):
         """
@@ -50,13 +63,18 @@ class BenchmarkGenerator:
         self.cross_shard_percent = cross_shard_percent / 100.0
         self.skew = skew
         self.num_transactions = num_transactions
+        self.num_clusters = num_clusters
+        self.nodes_per_cluster = nodes_per_cluster
+        self.total_keys = total_keys
+        self.shards = generate_shard_map(num_clusters, total_keys)
+        self.nodes = generate_nodes(num_clusters, nodes_per_cluster)
 
         if seed is not None:
             random.seed(seed)
 
         # Precompute Zipfian weights for each shard
         self._zipf_weights = {}
-        for shard_id, (lo, hi) in SHARDS.items():
+        for shard_id, (lo, hi) in self.shards.items():
             n = hi - lo + 1
             if skew > 0:
                 weights = [1.0 / ((i + 1) ** skew) for i in range(n)]
@@ -67,20 +85,20 @@ class BenchmarkGenerator:
 
     def _sample_key(self, shard_id: int) -> int:
         """Sample a key from the given shard using Zipfian distribution."""
-        lo, hi = SHARDS[shard_id]
+        lo, hi = self.shards[shard_id]
         n = hi - lo + 1
         offset = random.choices(range(n), weights=self._zipf_weights[shard_id], k=1)[0]
         return lo + offset
 
     def _generate_ro_tx(self) -> Tuple[int]:
         """Generate a read-only (balance query) transaction."""
-        shard_id = random.choice(list(SHARDS.keys()))
+        shard_id = random.choice(list(self.shards.keys()))
         key = self._sample_key(shard_id)
         return (key,)
 
     def _generate_rw_intra_tx(self) -> Tuple[int, int, int]:
         """Generate a read-write intra-shard transaction."""
-        shard_id = random.choice(list(SHARDS.keys()))
+        shard_id = random.choice(list(self.shards.keys()))
         src = self._sample_key(shard_id)
         dst = self._sample_key(shard_id)
         # Ensure src != dst
@@ -91,7 +109,7 @@ class BenchmarkGenerator:
 
     def _generate_rw_cross_tx(self) -> Tuple[int, int, int]:
         """Generate a read-write cross-shard transaction."""
-        shards = list(SHARDS.keys())
+        shards = list(self.shards.keys())
         src_shard = random.choice(shards)
         dst_shard = random.choice([s for s in shards if s != src_shard])
         src = self._sample_key(src_shard)
@@ -128,7 +146,7 @@ class BenchmarkGenerator:
             for i, tx in enumerate(transactions):
                 tx_str = str(tx).replace(" ", "")
                 if i == 0:
-                    writer.writerow([set_number, tx_str, ALL_NODES])
+                    writer.writerow([set_number, tx_str, all_nodes_str(self.nodes)])
                 else:
                     writer.writerow(["", tx_str, ""])
 
@@ -145,8 +163,8 @@ class BenchmarkGenerator:
         for tx in transactions:
             if len(tx) == 3:
                 src, dst, _ = tx
-                src_shard = self._get_shard(src)
-                dst_shard = self._get_shard(dst)
+                src_shard = self._get_shard_configured(src)
+                dst_shard = self._get_shard_configured(dst)
                 if src_shard != dst_shard:
                     cross_count += 1
                 else:
@@ -164,11 +182,14 @@ class BenchmarkGenerator:
     @staticmethod
     def _get_shard(key: int) -> int:
         """Get shard ID for a key."""
-        if key <= 3000:
-            return 1
-        if key <= 6000:
-            return 2
-        return 3
+        # Default assumes 3 shards; for configured runs we use the generator's shard map instead.
+        raise RuntimeError("Use BenchmarkGenerator._get_shard_configured()")
+
+    def _get_shard_configured(self, key: int) -> int:
+        for sid, (lo, hi) in self.shards.items():
+            if lo <= key <= hi:
+                return sid
+        return 1
 
 
 def main():
@@ -200,6 +221,24 @@ def main():
         help="Number of transactions to generate",
     )
     parser.add_argument(
+        "--clusters",
+        type=int,
+        default=3,
+        help="Number of clusters (default: 3)",
+    )
+    parser.add_argument(
+        "--nodes-per-cluster",
+        type=int,
+        default=3,
+        help="Nodes per cluster (default: 3)",
+    )
+    parser.add_argument(
+        "--total-keys",
+        type=int,
+        default=9000,
+        help="Total keys (default: 9000)",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -226,6 +265,9 @@ def main():
         cross_shard_percent=args.cross,
         skew=args.skew,
         num_transactions=args.count,
+        num_clusters=args.clusters,
+        nodes_per_cluster=args.nodes_per_cluster,
+        total_keys=args.total_keys,
         seed=args.seed,
     )
 
