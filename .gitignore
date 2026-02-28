@@ -1,4 +1,3 @@
-*.pdf
 # *.log
 .claude
 __pycache__
