@@ -1793,8 +1793,7 @@ class Node(process):
 			return
 
 	def receive(msg=('PRINT_DB', set_id)):
-		if self.is_failed:
-			return
+		# Failed nodes can still print their state before failure
 		if not self.modified_keys:
 			output(f"Set {set_id} {self.node_name} DB: []")
 			return
@@ -1805,8 +1804,7 @@ class Node(process):
 		output(f"Set {set_id} {self.node_name} DB: {changed}")
 
 	def receive(msg=('PRINT_VIEW', set_id)):
-		if self.is_failed:
-			return
+		# Failed nodes can still print their state before failure
 		if not self.new_view_messages:
 			output(f"Set {set_id} {self.node_name} View: []")
 			return
@@ -1816,8 +1814,7 @@ class Node(process):
 			output(f"Set {set_id} {self.node_name} View: {tag} {b_round} {b_leader} {log_len}")
 
 	def receive(msg=('PRINT_BALANCE', key_id)):
-		if self.is_failed:
-			return
+		# Failed nodes can still print their state before failure
 		bal = self.db.get(key_id, INITIAL_BALANCE)
 		output(f"{self.node_name} : {bal}")
 
@@ -1855,8 +1852,7 @@ class Node(process):
 		log_debug(f"{self.node_name} received key {key_id} (bal={balance}) from shard {source_shard}")
 
 	def receive(msg=('PRINT_RESHARD',)):
-		if self.is_failed:
-			return
+		# Failed nodes can still print their state before failure
 		moves = getattr(self, 'reshard_events', []) or []
 		output(f"{self.node_name} RESHARD: {moves}")
 
