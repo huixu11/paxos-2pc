@@ -8,11 +8,22 @@ import threading
 TIMEOUT = 3.0            # Base client/driver timeout
 HEARTBEAT_INTERVAL = 0.5
 HEARTBEAT_TIMEOUT = 1.5   # Allow some slack before suspecting leader failure
-ELECTION_TIMEOUT = 60.0   # Follower election timer - very long to account for slow DistAlgo message delivery
-PREPARE_BACKOFF = 2.0     # Suppress dueling prepares - longer per spec
-PREPARE_RETRY_INTERVAL = 1.5  # Candidate resend interval for PREPARE
+ELECTION_TIMEOUT = 6.0    # Follower election timer tuned for timely failover in tests
+PREPARE_BACKOFF = 1.0     # Suppress dueling prepares while allowing faster recovery
+PREPARE_RETRY_INTERVAL = 1.0  # Candidate resend interval for PREPARE
 MAX_CANDIDATE_TIME = 2 * ELECTION_TIMEOUT  # Give up and fall back to follower
-ELECTION_JITTER = 2.0     # Jitter to stagger elections
+ELECTION_JITTER = 1.0     # Jitter to stagger elections
+
+# Liveness guardrails (avoid infinite wait on a single transaction)
+CLIENT_MAX_RETRIES = 8
+CLIENT_MAX_WAIT = 20.0
+DRIVER_TX_MAX_WAIT = 20.0
+DRIVER_TX_TIMEOUT_RETRIES = 3
+DRIVER_RETRY_BACKOFF = 1.0
+FORCE_ELECTION_EVERY_MISSES = 4
+CLIENT_FORCE_ELECTION_EVERY_ATTEMPTS = 5
+POST_SET_QUIET_WINDOW = 1.5
+LF_STABILIZE_WAIT = 3.0
 
 # Logging controls
 VERBOSE_LOG = False       # Set True for detailed protocol tracing
@@ -74,22 +85,38 @@ class Client(process):
         self.shutdown = True
         log_debug("Client finishing")
     
+    def receive(msg=('TRIGGER_TX', tx, tx_token), from_=parent):
+        log_debug(f"Client triggered for {tx}")
+        result = request_transaction(tx, tx_token)
+        log_debug(f"Client completed {tx} with result {result}")
+        send(('TX_RESULT', tx_token, result), to=parent)
+
+    # Backward-compatible handler
     def receive(msg=('TRIGGER_TX', tx), from_=parent):
         log_debug(f"Client triggered for {tx}")
         result = request_transaction(tx)
         log_debug(f"Client completed {tx} with result {result}")
         send(('TX_RESULT', tx, result), to=parent)
     
-    def request_transaction(tx):
-        self.request_id += 1
-        req_id = (self.client_id, self.request_id)
+    def request_transaction(tx, stable_token=None):
+        if stable_token is None:
+            self.request_id += 1
+            req_id = (self.client_id, self.request_id)
+        else:
+            # Tie request identity to the driver token so TIMEOUT retries are idempotent.
+            req_id = (self.client_id, ('TOKEN', stable_token))
         timestamp = time.time()
+        started_at = timestamp
         self.pending = (req_id, tx, timestamp)
         
         attempts = 0
         wait_interval = TIMEOUT  # base retry interval
         
         while True:
+            if attempts >= CLIENT_MAX_RETRIES or (time.time() - started_at) >= CLIENT_MAX_WAIT:
+                self.pending = None
+                return "TIMEOUT"
+
             # Broadcast to all known nodes to ensure delivery even if leader fails
             send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id, self), to=self.nodes)
 
@@ -111,7 +138,7 @@ class Client(process):
             timer.cancel()
             attempts += 1
             # If we have been retrying for a while, nudge nodes to elect a leader
-            if attempts % 3 == 0:
+            if attempts % CLIENT_FORCE_ELECTION_EVERY_ATTEMPTS == 0:
                 send(('FORCE_ELECTION',), to=self.nodes)
             continue
 
@@ -138,9 +165,23 @@ class Driver(process):
             # Send both processes and their names
             name_mapping = {self.node_map[n]: n for n in live_nodes_set}
             send(('SET_LIVE', live_procs, name_mapping), to=self.nodes)
+
+        def wait_for_set_convergence():
+            """Small quiet window to let late protocol messages settle before next set."""
+            time.sleep(POST_SET_QUIET_WINDOW)
         
         for test_set in self.test_sets:
             log_info(f"=== Processing Set {test_set['id']} ===")
+            set_started = time.time()
+            set_stats = {
+                'tx_total': 0,
+                'tx_success': 0,
+                'tx_insufficient': 0,
+                'tx_timeout': 0,
+                'tx_other': 0,
+                'tx_skipped_no_quorum': 0
+            }
+            tx_token_counter = 0
             
             # Handle live nodes and track current live set
             if test_set['live_nodes']:
@@ -217,35 +258,99 @@ class Driver(process):
                             log_info(f"WARNING: LF reduced live nodes to {live_count()} - Quorum NOT met, remaining TX skipped")
                         else:
                             current_leader_name = sorted(list(live_nodes_set))[0] if live_nodes_set else None
-                        # Give the cluster time to elect a new leader before next request
-                        time.sleep(TIMEOUT * 0.5)
+                        # Give the cluster time to elect a new leader before next request.
+                        time.sleep(LF_STABILIZE_WAIT)
                         continue
+
+                    set_stats['tx_total'] += 1
                     
                     if not quorum_met:
                         log_debug(f"Tx {tx_data} -> SKIPPED (no quorum)")
+                        set_stats['tx_skipped_no_quorum'] += 1
                         continue
+
+                    tx_token_counter += 1
+                    tx_token = (str(test_set['id']), tx_token_counter)
                     
-                    send(('TRIGGER_TX', tx_data), to=self.client)
+                    # Retry TIMEOUT with the same tx_token so the request id is stable and idempotent.
+                    final_result = None
+                    tx_attempt = 0
+                    while tx_attempt < DRIVER_TX_TIMEOUT_RETRIES and final_result is None:
+                        tx_attempt += 1
+                        send(('TRIGGER_TX', tx_data, tx_token), to=self.client)
+                        
+                        wait_misses = 0
+                        tx_wait_start = time.time()
+                        retry_needed = False
+                        while True:
+                            if await(some(received(('TX_RESULT', rx_token, res)), has= rx_token == tx_token)):
+                                results = setof(res, received(('TX_RESULT', rx_token, res)), rx_token == tx_token)
+                                non_timeout = [r for r in results if r != "TIMEOUT"]
+                                if non_timeout:
+                                    result = sorted(non_timeout, key=lambda x: str(x))[0]
+                                else:
+                                    result = "TIMEOUT"
+
+                                if result == "TIMEOUT" and tx_attempt < DRIVER_TX_TIMEOUT_RETRIES:
+                                    live_procs = set(self.node_map[n] for n in live_nodes_set)
+                                    if live_procs:
+                                        send(('FORCE_ELECTION',), to=live_procs)
+                                    log_info(f"Tx {tx_data} -> TIMEOUT (retry {tx_attempt}/{DRIVER_TX_TIMEOUT_RETRIES - 1})")
+                                    time.sleep(DRIVER_RETRY_BACKOFF)
+                                    retry_needed = True
+                                else:
+                                    final_result = result
+                                break
+                            elif timeout(TIMEOUT):
+                                # If we didn't get a result in time, nudge an election among current live nodes
+                                live_procs = set(self.node_map[n] for n in live_nodes_set)
+                                wait_misses += 1
+                                if live_procs and (wait_misses % FORCE_ELECTION_EVERY_MISSES == 0):
+                                    send(('FORCE_ELECTION',), to=live_procs)
+                                if (time.time() - tx_wait_start) >= DRIVER_TX_MAX_WAIT:
+                                    if tx_attempt < DRIVER_TX_TIMEOUT_RETRIES:
+                                        if live_procs:
+                                            send(('FORCE_ELECTION',), to=live_procs)
+                                        log_info(f"Tx {tx_data} -> TIMEOUT (retry {tx_attempt}/{DRIVER_TX_TIMEOUT_RETRIES - 1})")
+                                        time.sleep(DRIVER_RETRY_BACKOFF)
+                                        retry_needed = True
+                                    else:
+                                        final_result = "TIMEOUT"
+                                    break
+                        if retry_needed:
+                            continue
                     
-                    wait_misses = 0
-                    while True:
-                        if await(some(received(('TX_RESULT', tx_val, res)), has= tx_val == tx_data)):
-                            results = setof(res, received(('TX_RESULT', tx_val, res)), tx_val == tx_data)
-                            result = results.pop()
-                            log_info(f"Tx {tx_data} -> {result}")
-                            break
-                        elif timeout(TIMEOUT):
-                            # If we didn't get a result in time, nudge an election among current live nodes
-                            live_procs = set(self.node_map[n] for n in live_nodes_set)
-                            wait_misses += 1
-                            if live_procs and (wait_misses % 3 == 0):
-                                send(('FORCE_ELECTION',), to=live_procs)
+                    if final_result is None:
+                        final_result = "TIMEOUT"
+
+                    log_info(f"Tx {tx_data} -> {final_result}")
+                    if final_result == "SUCCESS":
+                        set_stats['tx_success'] += 1
+                    elif final_result == "INSUFFICIENT_FUNDS":
+                        set_stats['tx_insufficient'] += 1
+                    elif final_result == "TIMEOUT":
+                        set_stats['tx_timeout'] += 1
+                    else:
+                        set_stats['tx_other'] += 1
             
             # Short settle so late ACCEPT/COMMITs can propagate before snapshot
             time.sleep(TIMEOUT * 0.5)
             log_info(f"=== End of Set {test_set['id']} ===")
             send(('PRINT_DB', test_set['id']), to=self.nodes)
             time.sleep(TIMEOUT * 0.25)
+            wait_for_set_convergence()
+            elapsed = time.time() - set_started
+            log_info(
+                f"Set {test_set['id']} Summary | "
+                f"elapsed={elapsed:.2f}s "
+                f"tx_total={set_stats['tx_total']} "
+                f"success={set_stats['tx_success']} "
+                f"insufficient={set_stats['tx_insufficient']} "
+                f"timeout={set_stats['tx_timeout']} "
+                f"other={set_stats['tx_other']} "
+                f"skipped_no_quorum={set_stats['tx_skipped_no_quorum']} "
+                f"convergence_wait={POST_SET_QUIET_WINDOW:.1f}s"
+            )
         
         # Cleanup: tell client and nodes to stop
         send(('DONE',), to=self.client)
@@ -629,61 +734,66 @@ class Node(process):
         if self.live_peers:
             send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
         
-        # Construct NEW-VIEW from quorum AcceptLogs
-        # Use comparable key for promises dictionary
+        # Construct NEW-VIEW from promise quorum AcceptLogs.
+        # For each sequence number, pick the value accepted with the highest ballot
+        # seen in the quorum; fill missing sequences with NO-OP.
         ballot_key = (self.ballot_num[0], self.ballot_num[1])
         all_entries = set()
         for acc_log in self.promises.get(ballot_key, {}).values():
             all_entries.update(acc_log)
         all_entries.update(self.accept_log)
-        
-        max_seq = max([e[1] for e in all_entries]) if all_entries else 0
-        
-        # Fill gaps with no-op and choose highest-ballot entry per seq
-        new_log = set()
-        for s in range(1, max_seq + 1):
-            entries_at_s = [e for e in all_entries if e[1] == s]
-            if entries_at_s:
-                best = max(entries_at_s)  # Highest ballot wins
-                chosen_val = best[2]
+
+        max_seq = 0
+        best_by_seq = {}  # seq -> ((ballot_num, ballot_node), value)
+        for entry in all_entries:
+            if not (isinstance(entry, tuple) and len(entry) == 3):
+                continue
+            b, seq, val = entry
+            if not isinstance(seq, int):
+                continue
+            if seq > max_seq:
+                max_seq = seq
+            if isinstance(b, tuple):
+                if len(b) >= 2:
+                    rank = (b[0], b[1])
+                elif len(b) == 1:
+                    rank = (b[0], '')
+                else:
+                    rank = (0, '')
+            else:
+                rank = (0, str(b))
+            cur = best_by_seq.get(seq)
+            if cur is None or rank > cur[0]:
+                best_by_seq[seq] = (rank, val)
+
+        ordered_new_log = []
+        for seq in range(1, max_seq + 1):
+            if seq in best_by_seq:
+                chosen_val = best_by_seq[seq][1]
             else:
                 chosen_val = 'NO-OP'
-            new_log.add((self.ballot_num, s, chosen_val))
-        
-        self.accept_log = new_log
+            ordered_new_log.append((self.ballot_num, seq, chosen_val))
+
+        self.accept_log = set(ordered_new_log)
         self.next_seq = max_seq + 1
-        
-        # Vote for own proposals in NEW-VIEW, seeding with promise quorum to avoid re-waiting
-        promise_voters = set(self.promises.get(ballot_key, {}).keys())
-        if self not in promise_voters:
-            promise_voters.add(self)
-        for (ballot, seq, val) in new_log:
-            key = (ballot, seq)
-            self.accepted_votes[key] = set(promise_voters)
-        
-        log_debug(f"Leader {self.node_name} NEW-VIEW: {len(new_log)} entries, seq range 1-{max_seq}")
-        
-        # Send NEW-VIEW
-        ordered_new_log = sorted(new_log, key=lambda e: e[1])
+
+        # Start NEW-VIEW slots with only the leader's own ACCEPTED vote.
+        for (_, seq, _) in ordered_new_log:
+            self.accepted_votes[(self.ballot_num, seq)] = {self}
+
+        log_debug(f"Leader {self.node_name} NEW-VIEW: {len(ordered_new_log)} entries, seq range 1-{max_seq}")
+
+        # Send NEW-VIEW and run normal accept/accepted/commit flow.
         nv_msg = ('NEW-VIEW', self.ballot_num, ordered_new_log)
         self.new_view_messages.append(nv_msg)
-        if not self.live_peers:
-            log_debug(f"{self.node_name} has no live peers to send NEW-VIEW")
-            return
         targets = set(self.live_peers)
-        send(nv_msg, to=targets)
-        # Also send ACCEPT to ensure peers record values even if they ignore NEW-VIEW
+        if targets:
+            send(nv_msg, to=targets)
         for (_, seq, val) in ordered_new_log:
             log_debug(f"{self.node_name} sending ACCEPT seq={seq} ballot={self.ballot_num}")
-            send(('ACCEPT', self.ballot_num, seq, val), to=targets)
+            if targets:
+                send(('ACCEPT', self.ballot_num, seq, val), to=targets)
             send(('ACCEPTED', self.ballot_num, seq, val, self), to=self)
-            # If the promise quorum is already a majority, commit immediately
-            key = (self.ballot_num, seq)
-            if len(self.accepted_votes.get(key, set())) > self.live_cluster_size / 2:
-                send(('COMMIT', self.ballot_num, seq, val), to=targets)
-                log_debug(f"{self.node_name} COMMIT (seed quorum) seq={seq} ballot={self.ballot_num}")
-                handle_commit(self.ballot_num, seq, val)
-        # Reinforce leadership immediately after seeding commits
         if targets:
             send(('HEARTBEAT', self.ballot_num, self), to=targets)
 
@@ -925,6 +1035,18 @@ class Node(process):
             
             # val is (tx, timestamp, cid, req_id, client_proc)
             tx, timestamp, cid, req_id, client_proc = val
+
+            # Exactly-once at execution: the same client request may appear again
+            # in a later slot after view changes/retries. Do not mutate state twice.
+            if (cid, req_id) in self.client_replies:
+                _, cached_result = self.client_replies[(cid, req_id)]
+                result = cached_result
+                if (cid, req_id) not in self.sent_replies:
+                    send(('CLIENT_REPLY', req_id, result), to=client_proc)
+                    self.sent_replies.add((cid, req_id))
+                self.pending_requests.discard((cid, req_id))
+                self.last_executed_seq = seq
+                continue
             
             # Execute transaction
             if len(tx) == 3:  # Transfer (sender, receiver, amount)
@@ -1024,8 +1146,8 @@ class Node(process):
         # If we're already a candidate, don't disrupt the ongoing election
         if self.status == 'CANDIDATE':
             return
-        # If we recently started an election, don't start another
-        if (time.time() - self.last_election_time) < ELECTION_TIMEOUT:
+        # If we very recently started an election, don't restart immediately
+        if (time.time() - self.last_election_time) < PREPARE_BACKOFF:
             return
         # Start election
         self.status = 'FOLLOWER'
@@ -1177,8 +1299,6 @@ class Node(process):
         output(f'{self.node_name}: {balance}')
     
     def receive(msg=('PRINT_DB', set_id)):
-        if self.is_failed:
-            return
         # Print all known clients
         sorted_clients = sorted(list(self.known_clients))
         items = []
