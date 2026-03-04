@@ -1102,6 +1102,45 @@ class Node(process):
 			start_election()
 		return False
 
+	def compact_ballot(ballot):
+		if isinstance(ballot, tuple) and len(ballot) >= 2:
+			return (ballot[0], ballot[1])
+		return ballot
+
+	def send_chunked_log(single_tag, chunk_tag, ballot, entries, chunk_size, targets):
+		payload = list(entries) if isinstance(entries, list) else list(entries)
+		if len(payload) <= chunk_size:
+			send((single_tag, ballot, payload), to=targets)
+			return
+		total_parts = (len(payload) + chunk_size - 1) // chunk_size
+		for idx in range(total_parts):
+			start = idx * chunk_size
+			end = start + chunk_size
+			chunk = payload[start:end]
+			send((chunk_tag, ballot, idx + 1, total_parts, chunk), to=targets)
+
+	def assemble_chunk_parts(buffers, key, part_idx, total_parts, chunk):
+		if total_parts <= 0 or part_idx <= 0 or part_idx > total_parts:
+			return None
+		buf = buffers.get(key)
+		if not buf or buf.get('total') != total_parts:
+			buf = {'total': total_parts, 'parts': {}}
+			buffers[key] = buf
+		if isinstance(chunk, list):
+			part = list(chunk)
+		elif isinstance(chunk, tuple):
+			part = list(chunk)
+		else:
+			part = []
+		buf['parts'][int(part_idx)] = part
+		if len(buf['parts']) < total_parts:
+			return None
+		merged = []
+		for idx in range(1, total_parts + 1):
+			merged.extend(buf['parts'].get(idx, []))
+		del buffers[key]
+		return merged
+
 	def become_leader():
 		self.status = 'LEADER'
 		self.leader = self
@@ -1143,13 +1182,13 @@ class Node(process):
 		ordered_new_log = []
 		# Use a compact ballot key in NEW-VIEW payload to avoid oversized messages.
 		# Full ballot tuples may include process objects, which inflate serialized size.
-		compact_ballot = (self.ballot_num[0], self.ballot_num[1]) if isinstance(self.ballot_num, tuple) and len(self.ballot_num) >= 2 else self.ballot_num
+		compact_ballot_key = compact_ballot(self.ballot_num)
 		for seq in range(1, max_seq + 1):
 			if seq in best_by_seq:
 				chosen_val = best_by_seq[seq][1]
 			else:
 				chosen_val = ('NO-OP',)
-			ordered_new_log.append((compact_ballot, seq, chosen_val))
+			ordered_new_log.append((compact_ballot_key, seq, chosen_val))
 
 		self.accept_log = set(ordered_new_log)
 		self.next_seq = max(self.next_seq, max_seq + 1)
@@ -1159,15 +1198,7 @@ class Node(process):
 		# Phase 2 for NEW-VIEW entries follows normal ACCEPT/ACCEPTED/COMMIT.
 		targets = set(self.live_peers)
 		if targets:
-			if len(ordered_new_log) <= NEW_VIEW_CHUNK_SIZE:
-				send(('NEW-VIEW', self.ballot_num, ordered_new_log), to=targets)
-			else:
-				total_parts = (len(ordered_new_log) + NEW_VIEW_CHUNK_SIZE - 1) // NEW_VIEW_CHUNK_SIZE
-				for idx in range(total_parts):
-					start = idx * NEW_VIEW_CHUNK_SIZE
-					end = start + NEW_VIEW_CHUNK_SIZE
-					chunk = ordered_new_log[start:end]
-					send(('NEW-VIEW-CHUNK', self.ballot_num, idx + 1, total_parts, chunk), to=targets)
+			send_chunked_log('NEW-VIEW', 'NEW-VIEW-CHUNK', self.ballot_num, ordered_new_log, NEW_VIEW_CHUNK_SIZE, targets)
 		for (_, seq, val) in ordered_new_log:
 			self.accepted_votes[(self.ballot_num, seq)] = {self}
 			if targets:
@@ -1243,21 +1274,11 @@ class Node(process):
 			return
 		if b < self.ballot_num:
 			return
-		if total_parts <= 0 or part_idx <= 0 or part_idx > total_parts:
-			return
-		b_key = (b[0], b[1]) if isinstance(b, tuple) and len(b) >= 2 else b
+		b_key = compact_ballot(b)
 		key = (leader, b_key)
-		buf = self.new_view_chunk_buffer.get(key)
-		if not buf or buf.get('total') != total_parts:
-			buf = {'total': total_parts, 'parts': {}}
-			self.new_view_chunk_buffer[key] = buf
-		buf['parts'][int(part_idx)] = list(chunk) if isinstance(chunk, list) else []
-		if len(buf['parts']) < total_parts:
+		full_log = assemble_chunk_parts(self.new_view_chunk_buffer, key, part_idx, total_parts, chunk)
+		if full_log is None:
 			return
-		full_log = []
-		for i in range(1, total_parts + 1):
-			full_log.extend(buf['parts'].get(i, []))
-		del self.new_view_chunk_buffer[key]
 		apply_new_view_state(leader, b, full_log)
 
 	def receive(msg=('FORCE_ELECTION',)):
@@ -1301,22 +1322,14 @@ class Node(process):
 		self.last_leader_msg = time.time()
 		serialized_log = []
 		for (ballot, seq, val) in self.accept_log:
-			ballot_key = (ballot[0], ballot[1]) if isinstance(ballot, tuple) and len(ballot) >= 2 else ballot
+			ballot_key = compact_ballot(ballot)
 			serialized_log.append((ballot_key, seq, val))
-		b_key = (b[0], b[1]) if isinstance(b, tuple) and len(b) >= 2 else b
-		if len(serialized_log) <= ACK_LOG_CHUNK_SIZE:
-			send(('ACK', b_key, serialized_log), to=proposer)
-		else:
-			total_parts = (len(serialized_log) + ACK_LOG_CHUNK_SIZE - 1) // ACK_LOG_CHUNK_SIZE
-			for idx in range(total_parts):
-				start = idx * ACK_LOG_CHUNK_SIZE
-				end = start + ACK_LOG_CHUNK_SIZE
-				chunk = serialized_log[start:end]
-				send(('ACK-PART', b_key, idx + 1, total_parts, chunk), to=proposer)
+		b_key = compact_ballot(b)
+		send_chunked_log('ACK', 'ACK-PART', b_key, serialized_log, ACK_LOG_CHUNK_SIZE, proposer)
 
 	def receive(msg=('ACK', b, acc_log), from_=p):
-		b_key = (b[0], b[1]) if isinstance(b, tuple) and len(b) >= 2 else b
-		my_key = (self.ballot_num[0], self.ballot_num[1]) if isinstance(self.ballot_num, tuple) and len(self.ballot_num) >= 2 else self.ballot_num
+		b_key = compact_ballot(b)
+		my_key = compact_ballot(self.ballot_num)
 		if isinstance(acc_log, list):
 			acc_log = set(acc_log)
 		if self.is_failed:
@@ -1345,8 +1358,8 @@ class Node(process):
 	def receive(msg=('ACK-PART', b, part_idx, total_parts, chunk), from_=p):
 		if self.is_failed:
 			return
-		b_key = (b[0], b[1]) if isinstance(b, tuple) and len(b) >= 2 else b
-		my_key = (self.ballot_num[0], self.ballot_num[1]) if isinstance(self.ballot_num, tuple) and len(self.ballot_num) >= 2 else self.ballot_num
+		b_key = compact_ballot(b)
+		my_key = compact_ballot(self.ballot_num)
 		if self.status != 'CANDIDATE':
 			if b_key != my_key:
 				send(('PREPARE', self.ballot_num), to=p)
@@ -1354,24 +1367,14 @@ class Node(process):
 		if b_key != my_key:
 			send(('PREPARE', self.ballot_num), to=p)
 			return
-		if total_parts <= 0 or part_idx <= 0 or part_idx > total_parts:
-			return
 		if b_key not in self.promises:
 			self.promises[b_key] = {}
 		if b_key not in self.promise_parts:
 			self.promise_parts[b_key] = {}
-		per_peer = self.promise_parts[b_key].get(p)
-		if not per_peer or per_peer.get('total') != total_parts:
-			per_peer = {'total': total_parts, 'parts': {}}
-			self.promise_parts[b_key][p] = per_peer
-		per_peer['parts'][int(part_idx)] = list(chunk) if isinstance(chunk, list) else []
-		if len(per_peer['parts']) < total_parts:
+		acc_list = assemble_chunk_parts(self.promise_parts[b_key], p, part_idx, total_parts, chunk)
+		if acc_list is None:
 			return
-		acc_list = []
-		for idx in range(1, total_parts + 1):
-			acc_list.extend(per_peer['parts'].get(idx, []))
 		self.promises[b_key][p] = set(acc_list)
-		self.promise_parts[b_key].pop(p, None)
 		majority = (self.cluster_size // 2) + 1
 		log_debug(f"{self.node_name} ACK-PART assembled: promises={len(self.promises[b_key])}, majority={majority}")
 		if len(self.promises[b_key]) >= majority:
@@ -1570,6 +1573,23 @@ class Node(process):
 		if txid in self.tx_table:
 			del self.tx_table[txid]
 
+	def tx_final_decision(txid):
+		meta = self.tx_meta.get(txid)
+		if not meta:
+			return None
+		return meta.get('decision')
+
+	def tx_participant_state(txid):
+		meta = self.tx_meta.get(txid)
+		if not meta:
+			return None
+		prep = meta.get('prepared', {})
+		if prep.get('PART') is True:
+			return 'PREPARED_COMMIT'
+		if prep.get('PART') is False:
+			return 'PREPARED_ABORT'
+		return None
+
 	def maybe_reply_client(txid, decision):
 		meta = self.tx_meta.get(txid)
 		client = meta.get('client') if meta else None
@@ -1760,14 +1780,44 @@ class Node(process):
 			return
 		if self.status != 'LEADER':
 			log_debug(f"{self.node_name} PREPARE_TX txid={txid} deferred (status={self.status}, live_peers={len(self.live_peers)})")
-			self.backlog_prepares.append((txid, tx, coord_shard, seq_p, seq_c))
+			# Keep backlog idempotent and avoid replaying finalized transactions.
+			if tx_final_decision(txid) is None:
+				already_buffered = False
+				for (txid_b, _, _, _, _) in self.backlog_prepares:
+					if txid_b == txid:
+						already_buffered = True
+						break
+				if not already_buffered:
+					self.backlog_prepares.append((txid, tx, coord_shard, seq_p, seq_c))
 			ensure_leader()
 			return
 		src, dst, amt = tx
+		# Idempotence on leader changes:
+		# if this tx is already decided locally, re-send decision to coordinator shard and stop.
+		final = tx_final_decision(txid)
+		coord_targets = self.cluster_map.get(coord_shard, set())
+		if final:
+			if coord_targets:
+				send(('DECISION', txid, final), to=coord_targets)
+			return
+		# If participant side was already prepared, do not lock/re-propose again.
+		# Re-send PREPARED/ABORT to help coordinator recover.
+		part_state = tx_participant_state(txid)
+		if part_state == 'PREPARED_COMMIT':
+			meta = self.tx_meta.get(txid, {})
+			part_write = meta.get('part_write') if isinstance(meta.get('part_write'), dict) else {}
+			if not part_write:
+				part_write = {dst: self.db.get(dst, INITIAL_BALANCE)}
+			if coord_targets:
+				send(('PREPARED', txid, tx, coord_shard, part_write), to=coord_targets)
+			return
+		if part_state == 'PREPARED_ABORT':
+			if coord_targets:
+				send(('ABORT_TX', txid), to=coord_targets)
+			return
 		# Use participant's own seq instead of coordinator's seq_p to ensure sequential execution
 		my_seq = self.next_seq
 		log_debug(f"{self.node_name} receive PREPARE_TX txid={txid} from shard={coord_shard} using local seq={my_seq} live_cluster={self.live_cluster_size}")
-		coord_targets = self.cluster_map.get(coord_shard, set())
 		if not acquire_lock(dst, txid):
 			log_debug(f"{self.node_name} PREPARE_TX txid={txid} lock failed for key={dst}, sending ABORT")
 			propose(('2PC_PREP_ABORT', txid, tx, 'PART'))
