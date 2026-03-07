@@ -3,6 +3,7 @@ import time
 import csv
 import random
 import threading
+import os
 
 # Configuration (balance liveness vs. churn)
 TIMEOUT = 3.0            # Base client/driver timeout
@@ -151,6 +152,20 @@ class Driver(process):
         self.nodes = nodes
         self.client = client_proc
         self.all_clients = all_clients
+        val = os.environ.get('REPORT_AUTOPRINT', '')
+        self.report_autoprint = val.lower() in ('1', 'true', 'yes')
+        interactive = False
+        try:
+            interactive = sys.stdin.isatty() and sys.stdout.isatty()
+        except Exception:
+            interactive = False
+        prompt_val = os.environ.get('PROMPT_SETS', '')
+        if prompt_val:
+            self.prompt_sets = prompt_val.lower() in ('1', 'true', 'yes', 'on')
+        else:
+            self.prompt_sets = interactive
+        self.skip_next_set = False
+        self.stop_requested = False
     
     def run():
         # Initialize known clients/balances on all nodes
@@ -169,8 +184,53 @@ class Driver(process):
         def wait_for_set_convergence():
             """Small quiet window to let late protocol messages settle before next set."""
             time.sleep(POST_SET_QUIET_WINDOW)
+
+        def emit_report_outputs_for_set(set_id):
+            """Emit report-required print outputs for Project 1 templates."""
+            try:
+                sid = int(set_id)
+            except Exception:
+                return
+            status_map = {
+                1: [1, 2, 3, 4, 5],
+                2: [6, 7],
+                3: [8, 9],
+                4: [10, 11],
+                5: [12, 13],
+                6: [12, 13, 14, 15, 16],
+                7: [17, 18, 19],
+                8: [20, 21, 22, 23, 24, 25],
+                9: [24, 25, 26, 27, 28, 29],
+                10: [30, 40, 50, 60, 70, 79],
+            }
+            view_sets = {5, 6, 8, 9}
+            log_node = {1: 'n1', 2: 'n5', 3: 'n2', 5: 'n1', 6: 'n1', 8: 'n1', 9: 'n4'}
+
+            output(f"REPORT Set {sid} BEGIN")
+            send(('PRINT_DB', set_id), to=self.nodes)
+            time.sleep(TIMEOUT * 0.1)
+
+            for seq in status_map.get(sid, []):
+                send(('PRINT_STATUS', int(seq), set_id), to=self.nodes)
+                time.sleep(TIMEOUT * 0.05)
+
+            if sid in view_sets:
+                send(('PRINT_VIEW', set_id), to=self.nodes)
+                time.sleep(TIMEOUT * 0.05)
+
+            ln = log_node.get(sid)
+            if ln and ln in self.node_map:
+                send(('PRINT_LOG', set_id), to=self.node_map[ln])
+                time.sleep(TIMEOUT * 0.05)
+            output(f"REPORT Set {sid} END")
         
         for test_set in self.test_sets:
+            if self.stop_requested:
+                break
+            if self.skip_next_set:
+                log_info(f"Skipping set {test_set['id']} (user request)")
+                self.skip_next_set = False
+                continue
             log_info(f"=== Processing Set {test_set['id']} ===")
             set_started = time.time()
             set_stats = {
@@ -337,7 +397,61 @@ class Driver(process):
             time.sleep(TIMEOUT * 0.5)
             log_info(f"=== End of Set {test_set['id']} ===")
             send(('PRINT_DB', test_set['id']), to=self.nodes)
+            if self.report_autoprint:
+                emit_report_outputs_for_set(test_set['id'])
             time.sleep(TIMEOUT * 0.25)
+            if self.prompt_sets:
+                while True:
+                    output(
+                        f"Set {test_set['id']} done. Commands: "
+                        f"PrintDB, PrintStatus(seq), PrintView, PrintLog(node), "
+                        f"'next'/'n'/Enter, 'skip', 'q'/'exit': "
+                    )
+                    try:
+                        cmd = input().strip()
+                    except EOFError:
+                        output("PROMPT_SETS: no stdin available, continuing")
+                        break
+                    except Exception:
+                        output("PROMPT_SETS: input unavailable, continuing")
+                        break
+
+                    lower = cmd.lower()
+                    if lower in ('q', 'exit'):
+                        self.stop_requested = True
+                        break
+                    if lower == 'skip':
+                        self.skip_next_set = True
+                        break
+                    if lower in ('', 'next', 'n'):
+                        break
+                    if lower in ('printdb', 'db'):
+                        send(('PRINT_DB', test_set['id']), to=self.nodes)
+                        time.sleep(TIMEOUT * 0.1)
+                        continue
+                    if lower in ('printview', 'view'):
+                        send(('PRINT_VIEW', test_set['id']), to=self.nodes)
+                        time.sleep(TIMEOUT * 0.1)
+                        continue
+                    if lower.startswith('printstatus'):
+                        payload = cmd.replace('PrintStatus', '').replace('printstatus', '').replace('(', '').replace(')', '').strip()
+                        if payload.isdigit():
+                            send(('PRINT_STATUS', int(payload), test_set['id']), to=self.nodes)
+                            time.sleep(TIMEOUT * 0.1)
+                            continue
+                        output("Usage: PrintStatus(seq)")
+                        continue
+                    if lower.startswith('printlog'):
+                        payload = cmd.replace('PrintLog', '').replace('printlog', '').replace('(', '').replace(')', '').strip()
+                        if payload in self.node_map:
+                            send(('PRINT_LOG', test_set['id']), to=self.node_map[payload])
+                            time.sleep(TIMEOUT * 0.1)
+                            continue
+                        output("Usage: PrintLog(n1)")
+                        continue
+                    output("Unknown command. Use PrintDB, PrintStatus(seq), PrintView, PrintLog(node), next, skip, or q.")
+                if self.stop_requested:
+                    break
             wait_for_set_convergence()
             elapsed = time.time() - set_started
             log_info(
@@ -364,6 +478,7 @@ class Node(process):
     def setup(node_name:str, peers:set, is_initial_leader:bool):
         self.node_name = node_name
         self.cluster_size = len(peers)  # Total cluster size for quorum checks
+        self.quorum_size = (self.cluster_size // 2) + 1
         self.peers = peers - {self}
         # live_peers will be set explicitly via SET_LIVE from the driver; default to all others
         self.live_peers = set(self.peers)
@@ -458,11 +573,11 @@ class Node(process):
                     if self not in voters:
                         voters.add(self)
                     votes = len(voters)
-                    if votes <= self.live_cluster_size / 2:
+                    if votes < self.quorum_size:
                         retry_targets.append((seq, val))
                 if retry_targets and self.live_peers:
                     for seq, val in retry_targets:
-                        log_debug(f"{self.node_name} RETRY_ACCEPT seq={seq} ballot={self.ballot_num} votes={len(self.accepted_votes.get((self.ballot_num, seq), set()))}/{self.live_cluster_size}")
+                        log_debug(f"{self.node_name} RETRY_ACCEPT seq={seq} ballot={self.ballot_num} votes={len(self.accepted_votes.get((self.ballot_num, seq), set()))}/{self.quorum_size}")
                         send(('ACCEPT', self.ballot_num, seq, val), to=self.live_peers)
                 await(timeout(HEARTBEAT_INTERVAL))
             
@@ -709,10 +824,10 @@ class Node(process):
         if b_key not in self.promises:
             self.promises[b_key] = {}
         self.promises[b_key][p] = set(acc_log)
-        log_debug(f"{self.node_name} collected ACK from {p} key={b_key} total={len(self.promises[b_key])}/{self.live_cluster_size}")
+        log_debug(f"{self.node_name} collected ACK from {p} key={b_key} total={len(self.promises[b_key])}/{self.quorum_size}")
 
         # Check for majority
-        majority = (self.live_cluster_size // 2) + 1
+        majority = self.quorum_size
         if len(self.promises[b_key]) >= majority:
             log_debug(f"{self.node_name} got majority promises! Becoming leader.")
             become_leader()
@@ -943,10 +1058,10 @@ class Node(process):
         now = time.time()
         self.last_leader_msg = now
         self.last_election_time = now
-        log_debug(f"{self.node_name} ACCEPTED from {node} seq={seq} votes={len(self.accepted_votes[key])}/{self.live_cluster_size}")
+        log_debug(f"{self.node_name} ACCEPTED from {node} seq={seq} votes={len(self.accepted_votes[key])}/{self.quorum_size}")
         
-        # Check for majority based on live cluster size
-        if len(self.accepted_votes[key]) > self.live_cluster_size / 2:
+        # Paxos quorum is based on the fixed cluster size, not the transient live set.
+        if len(self.accepted_votes[key]) >= self.quorum_size:
             # Commit
             if self.live_peers:
                 send(('COMMIT', b, seq, val), to=self.live_peers)

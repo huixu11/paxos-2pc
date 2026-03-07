@@ -306,6 +306,8 @@ class Driver(process):
 		self.prompt_balance = _env_flag('PROMPT_BALANCE', interactive)
 		skip_env = os.environ.get('SKIP_SETS', '')
 		self.skip_sets = {s.strip() for s in skip_env.split(',') if s.strip()}
+		val = os.environ.get('REPORT_AUTOPRINT', '')
+		self.report_autoprint = val.lower() in ('1', 'true', 'yes')
 		# Resharding: track cross-shard transaction pairs (src_key, dst_key)
 		self.tx_history = []
 		self.reshard_moves = []
@@ -316,6 +318,57 @@ class Driver(process):
 		self.client_writes = {}
 
 	def run():
+		def auto_report_for_set(set_id):
+			try:
+				sid = int(set_id)
+			except Exception:
+				return
+			output(f"REPORT Set {sid} BEGIN")
+			if sid == 1:
+				for k in [1001, 1002, 3001, 3002, 6001, 6002]:
+					self._print_balance(k)
+			elif sid == 2:
+				send(('PRINT_DB', set_id), to=list(self.all_nodes))
+				time.sleep(TIMEOUT * 0.1)
+			elif sid == 3:
+				for k in [6001, 6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010, 6011, 6012, 6013, 6014]:
+					self._print_balance(k)
+				send(('PRINT_VIEW', set_id), to=list(self.all_nodes))
+				time.sleep(TIMEOUT * 0.1)
+			elif sid == 4:
+				for k in [3001, 3002, 3003, 3004, 3005, 3006]:
+					self._print_balance(k)
+			elif sid == 5:
+				for k in [1001, 1002, 1003, 1004, 3001, 3002, 3003, 3004, 6001, 6002, 6003, 6004]:
+					self._print_balance(k)
+			elif sid == 6:
+				for k in [1, 2, 3, 4, 5, 6, 7, 8, 3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 6001, 6002, 6003, 6004, 6005, 6006, 6007, 6008]:
+					self._print_balance(k)
+			elif sid == 7:
+				for k in [1, 2, 3, 4, 5, 3001, 3002, 3003, 3004, 6001, 6002, 6003]:
+					self._print_balance(k)
+				send(('PRINT_VIEW', set_id), to=list(self.all_nodes))
+				time.sleep(TIMEOUT * 0.1)
+			elif sid == 8:
+				for k in [1, 2, 3, 4, 3001, 3002, 3003, 3004, 3005, 6001, 6002, 6003]:
+					self._print_balance(k)
+				send(('PRINT_VIEW', set_id), to=list(self.all_nodes))
+				time.sleep(TIMEOUT * 0.1)
+			elif sid == 9:
+				for k in [1001, 1002, 1003, 1004, 1005, 4001]:
+					self._print_balance(k)
+				self._do_reshard()
+				send(('PRINT_RESHARD',), to=list(self.all_nodes))
+				time.sleep(TIMEOUT * 0.1)
+				self._print_balance(4001)
+			elif sid == 10:
+				self._print_perf()
+			elif sid == 15:
+				for k in [1, 2, 3, 4, 1801, 1802, 1803, 1804, 3601, 3602, 3603, 3604, 5401, 5402, 5403, 5404, 7201, 7202, 7203, 7204]:
+					self._print_balance(k)
+				self._print_perf()
+			output(f"REPORT Set {sid} END")
+
 		for set_info in self.test_sets:
 			set_id = set_info['id']
 			txs = set_info['transactions']
@@ -515,6 +568,8 @@ class Driver(process):
 			log_info(f"Set {set_id} throughput={throughput:.2f} tx/s avg_lat={avg_lat:.3f}s count={total}")
 			self.stats[set_id] = {'throughput': throughput, 'avg_lat': avg_lat, 'count': total}
 			output(f"Set {set_id} throughput={throughput:.2f} avg_lat={avg_lat:.3f}s count={total}")
+			if self.report_autoprint:
+				auto_report_for_set(set_id)
 
 			# Post-set commands (PrintDB/PrintView/Performance/PrintBalance/Reshard) are handled in the prompt below.
 			time.sleep(TIMEOUT * 0.1)
@@ -523,7 +578,7 @@ class Driver(process):
 				while True:
 					prompt = (
 						f"Set {set_id} done. Commands: "
-						f"PrintBalance(ID), PrintDB, PrintView, Performance, Reshard, "
+						f"PrintBalance(ID), PrintDB, PrintLog, PrintStatus(seq), PrintView, Performance, Reshard, "
 						f"'next'/'n', 'skip', 'q'/'exit': "
 					)
 					output(prompt)
@@ -551,6 +606,18 @@ class Driver(process):
 					if cmd.lower() in ('printdb', 'db'):
 						send(('PRINT_DB', set_id), to=list(self.all_nodes))
 						time.sleep(TIMEOUT * 0.1)
+						continue
+					if cmd.lower() in ('printlog', 'log'):
+						send(('PRINT_LOG', set_id), to=list(self.all_nodes))
+						time.sleep(TIMEOUT * 0.1)
+						continue
+					if cmd.lower().startswith('printstatus'):
+						payload = cmd.replace('PrintStatus', '').replace('printstatus', '').replace('(', '').replace(')', '').strip()
+						if payload.isdigit():
+							send(('PRINT_STATUS', int(payload), set_id), to=list(self.all_nodes))
+							time.sleep(TIMEOUT * 0.1)
+							continue
+						output("Usage: PrintStatus(seq)")
 						continue
 					if cmd.lower() in ('printview', 'view'):
 						send(('PRINT_VIEW', set_id), to=list(self.all_nodes))
@@ -622,22 +689,22 @@ class Driver(process):
 		if not targets:
 			output(f"PrintBalance({key_id}): []")
 			return
+		ordered_targets = sorted(targets, key=lambda p: self.proc_to_name.get(p, str(p)))
 		req_id = (key_id, time.time())
 		self.balance_responses[req_id] = {}
-		send(('GET_BALANCE', key_id, req_id, self), to=targets)
+		# PrintBalance should include all replicas of the shard, even nodes currently marked failed.
+		send(('GET_BALANCE_FORCE', key_id, req_id, self), to=targets)
 		deadline = time.time() + TIMEOUT
 		while time.time() < deadline:
 			if len(self.balance_responses.get(req_id, {})) >= len(targets):
 				break
 			await(timeout(0.05))
 		results = self.balance_responses.pop(req_id, {})
-		ordered = [f"{name} : {results.get(name, '?')}" for name in sorted(results.keys())]
-		if ordered:
-			# Match spec example output: "n4 : 8, n5 : 8, n6 : 10"
-			output(", ".join(ordered))
-		else:
-			missing = [self.proc_to_name.get(p, str(p)) for p in targets]
-			output(f"missing replies from {missing}")
+		ordered = []
+		for proc in ordered_targets:
+			name = self.proc_to_name.get(proc, str(proc))
+			ordered.append(f"{name} : {results.get(name, '?')}")
+		output(", ".join(ordered))
 
 	def _do_reshard():
 		"""Reshard according to the spec idea (transaction hypergraph partitioning, offline).
@@ -1713,9 +1780,19 @@ class Node(process):
 		# For now, all writes go through normal path
 		
 		if shard_src == self.cluster_id and shard_dst == self.cluster_id:
-			# Intra-shard transfers must be replicated via Paxos before replying (spec).
-			# We replicate the request with its txid; commit/abort is decided at execution time
-			# based on the replica state at that log position (deterministic across replicas).
+			# Project 3 requires the leader to check and lock both records before replication.
+			lock_keys = (src,) if src == dst else (src, dst)
+			for key in lock_keys:
+				if not acquire_lock(key, txid):
+					release_locks(txid)
+					send(('TX_RESULT', txid, 'ABORT'), to=client)
+					self.tx_client[txid] = client
+					return
+			if self.db.get(src, INITIAL_BALANCE) < amt:
+				release_locks(txid)
+				send(('TX_RESULT', txid, 'ABORT'), to=client)
+				self.tx_client[txid] = client
+				return
 			propose(('LOCAL_TX', txid, (src, dst, amt)))
 			return
 		participants = (shard_dst,)
@@ -2106,6 +2183,27 @@ class Node(process):
 		changed = ", ".join(pairs)
 		output(f"Set {set_id} {self.node_name} DB: {changed}")
 
+	def receive(msg=('PRINT_LOG', set_id)):
+		entries = list(self.accept_log)
+		entries.sort(key=lambda e: (e[1], str(e[0]), str(e[2])) if isinstance(e, tuple) and len(e) >= 3 else str(e))
+		output(f"Set {set_id} {self.node_name} Log: {entries}")
+
+	def receive(msg=('PRINT_STATUS', seq, set_id)):
+		try:
+			s = int(seq)
+		except Exception:
+			s = seq
+		if s in self.committed_log:
+			if isinstance(s, int) and s <= self.last_executed:
+				status = 'E'
+			else:
+				status = 'C'
+		elif any(isinstance(e, tuple) and len(e) >= 2 and e[1] == s for e in self.accept_log):
+			status = 'A'
+		else:
+			status = 'X'
+		output(f"Set {set_id} {self.node_name}: {status}")
+
 	def receive(msg=('PRINT_VIEW', set_id)):
 		# Failed nodes can still print their state before failure
 		if not self.new_view_messages:
@@ -2122,6 +2220,10 @@ class Node(process):
 	def receive(msg=('GET_BALANCE', key_id, req_id, requester)):
 		if self.is_failed:
 			return
+		bal = self.db.get(key_id, INITIAL_BALANCE)
+		send(('BALANCE_RESULT', req_id, self.node_name, bal), to=requester)
+
+	def receive(msg=('GET_BALANCE_FORCE', key_id, req_id, requester)):
 		bal = self.db.get(key_id, INITIAL_BALANCE)
 		send(('BALANCE_RESULT', req_id, self.node_name, bal), to=requester)
 
