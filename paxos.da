@@ -360,6 +360,7 @@ class Driver(process):
                 log_info(f"Skipping set {test_set['id']} (user request)")
                 self.skip_next_set = False
                 continue
+            send(('START_SET', test_set['id']), to=self.nodes)
             log_info(f"=== Processing Set {test_set['id']} ===")
             set_started = time.time()
             set_stats = {
@@ -670,6 +671,7 @@ class Node(process):
         # For PrintView
         self.new_view_messages = []
         self.request_trace = {}
+        self.current_test_set = None
 
         # Mapping of peer processes to their node names (for tie-breaking)
         self.peer_names = {}  # process -> node_name
@@ -1640,12 +1642,18 @@ class Node(process):
         self.pause_no_quorum = False
         self.new_view_messages = []
         self.request_trace = {}
+        self.current_test_set = None
         self.last_leader_msg = time.time()
         self.buffered_prepare = None
         self.last_prepare_received_time = 0.0
         self.last_election_time = 0.0
         self.candidate_start_time = 0.0
         self.leader_grace_until = 0.0
+
+    def receive(msg=('START_SET', set_id)):
+        if self.current_test_set != set_id:
+            self.current_test_set = set_id
+            self.new_view_messages = []
     
     # === Print Functions ===
     
