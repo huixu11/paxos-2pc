@@ -23,8 +23,11 @@ DRIVER_TX_TIMEOUT_RETRIES = 3
 DRIVER_RETRY_BACKOFF = 1.0
 FORCE_ELECTION_EVERY_MISSES = 4
 CLIENT_FORCE_ELECTION_EVERY_ATTEMPTS = 5
-POST_SET_QUIET_WINDOW = 1.5
-LF_STABILIZE_WAIT = 3.0
+SET_LIVE_SETTLE_WAIT = 0.05
+PRINT_PROPAGATION_WAIT = 0.05
+POST_SET_SETTLE_WAIT = 0.10
+POST_SET_QUIET_WINDOW = 0.20
+LF_STABILIZE_WAIT = 1.0
 
 # Logging controls
 VERBOSE_LOG = False       # Set True for detailed protocol tracing
@@ -166,6 +169,7 @@ class Driver(process):
             self.prompt_sets = interactive
         self.skip_next_set = False
         self.stop_requested = False
+        self.batch_mode = (not self.prompt_sets) and (not self.report_autoprint)
     
     def run():
         # Initialize known clients/balances on all nodes
@@ -183,7 +187,8 @@ class Driver(process):
 
         def wait_for_set_convergence():
             """Small quiet window to let late protocol messages settle before next set."""
-            time.sleep(POST_SET_QUIET_WINDOW)
+            if POST_SET_QUIET_WINDOW > 0:
+                time.sleep(POST_SET_QUIET_WINDOW)
 
         def emit_report_outputs_for_set(set_id):
             """Emit report-required print outputs for Project 1 templates."""
@@ -208,20 +213,20 @@ class Driver(process):
 
             output(f"REPORT Set {sid} BEGIN")
             send(('PRINT_DB', set_id), to=self.nodes)
-            time.sleep(TIMEOUT * 0.1)
+            time.sleep(PRINT_PROPAGATION_WAIT)
 
             for seq in status_map.get(sid, []):
                 send(('PRINT_STATUS', int(seq), set_id), to=self.nodes)
-                time.sleep(TIMEOUT * 0.05)
+                time.sleep(PRINT_PROPAGATION_WAIT)
 
             if sid in view_sets:
                 send(('PRINT_VIEW', set_id), to=self.nodes)
-                time.sleep(TIMEOUT * 0.05)
+                time.sleep(PRINT_PROPAGATION_WAIT)
 
             ln = log_node.get(sid)
             if ln and ln in self.node_map:
                 send(('PRINT_LOG', set_id), to=self.node_map[ln])
-                time.sleep(TIMEOUT * 0.05)
+                time.sleep(PRINT_PROPAGATION_WAIT)
             output(f"REPORT Set {sid} END")
         
         for test_set in self.test_sets:
@@ -259,7 +264,7 @@ class Driver(process):
             push_live_set(live_nodes_set)
 
             # Give RECOVER/FAIL a brief window to settle
-            time.sleep(TIMEOUT * 0.05)
+            time.sleep(SET_LIVE_SETTLE_WAIT)
             
             def live_count():
                 return len(live_nodes_set)
@@ -306,7 +311,7 @@ class Driver(process):
                         
                         # First update live set so nodes have correct peer_names for tie-breaking
                         push_live_set(live_nodes_set)
-                        time.sleep(0.1)  # Brief wait for SET_LIVE to be processed
+                        time.sleep(SET_LIVE_SETTLE_WAIT)  # Brief wait for SET_LIVE to be processed
                         
                         # Then trigger election among remaining live nodes
                         live_procs = set(self.node_map[n] for n in live_nodes_set)
@@ -394,12 +399,13 @@ class Driver(process):
                         set_stats['tx_other'] += 1
             
             # Short settle so late ACCEPT/COMMITs can propagate before snapshot
-            time.sleep(TIMEOUT * 0.5)
+            time.sleep(POST_SET_SETTLE_WAIT)
             log_info(f"=== End of Set {test_set['id']} ===")
-            send(('PRINT_DB', test_set['id']), to=self.nodes)
+            if not self.batch_mode:
+                send(('PRINT_DB', test_set['id']), to=self.nodes)
+                time.sleep(PRINT_PROPAGATION_WAIT)
             if self.report_autoprint:
                 emit_report_outputs_for_set(test_set['id'])
-            time.sleep(TIMEOUT * 0.25)
             if self.prompt_sets:
                 while True:
                     output(
@@ -427,17 +433,17 @@ class Driver(process):
                         break
                     if lower in ('printdb', 'db'):
                         send(('PRINT_DB', test_set['id']), to=self.nodes)
-                        time.sleep(TIMEOUT * 0.1)
+                        time.sleep(PRINT_PROPAGATION_WAIT)
                         continue
                     if lower in ('printview', 'view'):
                         send(('PRINT_VIEW', test_set['id']), to=self.nodes)
-                        time.sleep(TIMEOUT * 0.1)
+                        time.sleep(PRINT_PROPAGATION_WAIT)
                         continue
                     if lower.startswith('printstatus'):
                         payload = cmd.replace('PrintStatus', '').replace('printstatus', '').replace('(', '').replace(')', '').strip()
                         if payload.isdigit():
                             send(('PRINT_STATUS', int(payload), test_set['id']), to=self.nodes)
-                            time.sleep(TIMEOUT * 0.1)
+                            time.sleep(PRINT_PROPAGATION_WAIT)
                             continue
                         output("Usage: PrintStatus(seq)")
                         continue
@@ -445,7 +451,7 @@ class Driver(process):
                         payload = cmd.replace('PrintLog', '').replace('printlog', '').replace('(', '').replace(')', '').strip()
                         if payload in self.node_map:
                             send(('PRINT_LOG', test_set['id']), to=self.node_map[payload])
-                            time.sleep(TIMEOUT * 0.1)
+                            time.sleep(PRINT_PROPAGATION_WAIT)
                             continue
                         output("Usage: PrintLog(n1)")
                         continue
