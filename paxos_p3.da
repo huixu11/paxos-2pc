@@ -578,7 +578,7 @@ class Driver(process):
 				while True:
 					prompt = (
 						f"Set {set_id} done. Commands: "
-						f"PrintBalance(ID), PrintDB, PrintLog, PrintStatus(seq), PrintView, Performance, Reshard, "
+						f"PrintBalance(ID), PrintDB, PrintLog, PrintStatus(seq), PrintView, Performance, PrintReshard/Reshard, "
 						f"'next'/'n', 'skip', 'q'/'exit': "
 					)
 					output(prompt)
@@ -626,7 +626,7 @@ class Driver(process):
 					if cmd.lower() in ('performance', 'perf'):
 						self._print_perf()
 						continue
-					if cmd.lower() == 'reshard':
+					if cmd.lower() in ('printreshard', 'reshard'):
 						self._do_reshard()
 						continue
 					if not cmd:
@@ -951,17 +951,8 @@ class Node(process):
 				await(timeout(HEARTBEAT_INTERVAL * 0.75))
 				# Resend outstanding 2PC decisions if needed
 				now = time.time()
-				for txid, info in list(self.decision_outbox.items()):
-					if now - info.get('last_sent', 0) >= PREPARE_RETRY_INTERVAL:
-						desc = info.get('decision')
-						client_reply = info.get('client_reply', desc)
-						targets = info.get('targets', set())
-						if targets:
-							send(('DECISION', txid, desc), to=targets)
-						self.decision_outbox[txid]['last_sent'] = now
-						client = info.get('client')
-						if client:
-							send(('TX_RESULT', txid, client_reply), to=client)
+				for txid in list(self.decision_outbox.keys()):
+					send_coord_decision(txid)
 				# Drive any fully prepared-but-undecided 2PCs after leadership changes.
 				drive_pending_decisions()
 				# Also recover incomplete 2PCs (COORD prepared but PART not yet)
@@ -981,16 +972,8 @@ class Node(process):
 									send(('PREPARE_TX', txid, self.tx_meta[txid]['tx'], self.cluster_id, meta.get('seq_p'), meta.get('seq_p')), to=targets)
 									meta['last_prepare_sent'] = now
 									self.pending_2pc[txid] = meta
-					if now - meta.get('ts', now) > TWO_PC_TIMEOUT and txid in self.tx_meta:
-						decision = 'ABORT'
-						seq_c = self.tx_meta[txid].get('commit_seq') or self.tx_meta[txid].get('prepare_seq') or self.next_seq
-						propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
-						for shard in self.tx_meta[txid].get('participants', ()): 
-							targets = self.cluster_map.get(shard, set())
-							if targets:
-								send(('DECISION', txid, decision), to=targets)
-								self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': now, 'client': self.tx_meta[txid].get('client')}
-						del self.pending_2pc[txid]
+					if meta.get('state') == 'WAIT_PREPARED' and now - meta.get('ts', now) > TWO_PC_TIMEOUT and txid in self.tx_meta:
+						start_coord_phase2(txid, 'ABORT')
 				# Retry pending PREPARED messages to coordinator
 				for txid, info in list(self.pending_prepared_outbox.items()):
 					if info.get('decision_received'):
@@ -1048,8 +1031,11 @@ class Node(process):
 				if self.backlog_decisions:
 					pending_dec = list(self.backlog_decisions)
 					self.backlog_decisions = []
-					for txid, decision in pending_dec:
-						send(('DECISION', txid, decision), to=self)
+					for txid, decision, decision_role, _origin in pending_dec:
+						if decision_role == 'COORD':
+							start_coord_phase2(txid, decision)
+						else:
+							send(('DECISION', txid, decision), to=self)
 			else:  # CANDIDATE
 				if await(self.status != 'CANDIDATE' or self.shutdown):
 					pass
@@ -1068,28 +1054,7 @@ class Node(process):
 			if not meta or meta.get('decision'):
 				continue
 			if meta.get('prepared', {}).get('COORD') and meta.get('prepared', {}).get('PART'):
-					decision = 'COMMIT'
-					seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
-					if seq_c is None:
-						seq_c = self.next_seq
-					propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
-					client = meta.get('client')
-					for shard in meta.get('participants', ()): 
-						targets = self.cluster_map.get(shard, set())
-						if targets:
-							send(('DECISION', txid, decision), to=targets)
-							reply = decision
-							tx = meta.get('tx')
-							if decision == 'COMMIT' and tx and len(tx) >= 3:
-								src, dst, _amt = tx[0], tx[1], tx[2]
-								write_info = {src: self.db.get(src, INITIAL_BALANCE)}
-								pw = meta.get('part_write') if isinstance(meta.get('part_write'), dict) else {}
-								for k, v in (pw or {}).items():
-									write_info[int(k)] = v
-								reply = ('COMMIT', write_info)
-							self.decision_outbox[txid] = {'decision': decision, 'client_reply': reply, 'targets': set(targets), 'last_sent': time.time(), 'client': client}
-					if client:
-						send(('TX_RESULT', txid, reply), to=client)
+				start_coord_phase2(txid, 'COMMIT')
 
 	def drive_incomplete_2pc():
 		"""Recover incomplete 2PC transactions when becoming new leader.
@@ -1286,8 +1251,11 @@ class Node(process):
 		if self.backlog_decisions:
 			pending_dec = list(self.backlog_decisions)
 			self.backlog_decisions = []
-			for txid, decision in pending_dec:
-				send(('DECISION', txid, decision), to=self)
+			for txid, decision, decision_role, _origin in pending_dec:
+				if decision_role == 'COORD':
+					start_coord_phase2(txid, decision)
+				else:
+					send(('DECISION', txid, decision), to=self)
 		if self.backlog_prepares:
 			pending_preps = list(self.backlog_prepares)
 			self.backlog_prepares = []
@@ -1298,6 +1266,7 @@ class Node(process):
 		# Recover any incomplete 2PC transactions as new leader
 		drive_incomplete_2pc()
 		drive_pending_decisions()
+		recover_coord_decision_delivery()
 
 	# === Paxos message handlers ===
 	def receive(msg=('HEARTBEAT', b, leader_proc), from_=p):
@@ -1578,6 +1547,7 @@ class Node(process):
 	def apply_prepare_entry(txid, tx, role, commit_allowed:bool):
 		src, dst, amt = tx
 		meta = self.tx_meta.setdefault(txid, {'tx': tx, 'prepared': {}, 'decision': None, 'prepare_seq': None, 'commit_seq': None, 'client': None, 'participants': ()})
+		participant_shards_for_meta(meta)
 		# Exactly-once for prepare side effects per (txid, role).
 		if role in meta.get('prepared', {}):
 			return
@@ -1602,16 +1572,10 @@ class Node(process):
 					send(('PREPARED', txid, tx, coord_shard, part_write), to=targets)
 					# Store for retry if DECISION not received
 					self.pending_prepared_outbox[txid] = {'coord_shard': coord_shard, 'tx': tx, 'part_write': part_write, 'last_sent': time.time(), 'decision_received': False, 'entry_ts': time.time()}
-		if role == 'COORD' and self.status == 'LEADER' and meta['prepared'].get('PART') and not meta.get('decision'):
-			decision = 'COMMIT'
-			seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
-			if seq_c is None:
-				seq_c = self.next_seq
-			propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
-			for shard in meta.get('participants', ()): 
-				targets = self.cluster_map.get(shard, set())
-				send(('DECISION', txid, decision), to=targets)
-				self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time()}
+		if role == 'COORD':
+			participant_shards_for_meta(meta)
+			if self.status == 'LEADER' and meta['prepared'].get('PART') and not meta.get('decision'):
+				start_coord_phase2(txid, 'COMMIT')
 
 	def apply_decision_entry(txid, decision, role):
 		meta = self.tx_meta.get(txid)
@@ -1620,6 +1584,14 @@ class Node(process):
 		if meta.get('decision') and meta['decision'] == decision:
 			return
 		meta['decision'] = decision
+		if role == 'COORD':
+			meta['coord_phase2_started'] = decision
+			if participant_shards_for_meta(meta):
+				meta['participant_ack'] = meta.get('participant_ack', False)
+			else:
+				meta['participant_ack'] = True
+		elif role == 'PART':
+			meta['part_phase2_started'] = decision
 		self.tx_meta[txid] = meta
 		tx = meta.get('tx')
 		if decision == 'COMMIT':
@@ -1629,11 +1601,15 @@ class Node(process):
 		else:
 			undo_wal(txid)
 			release_locks(txid)
-		maybe_reply_client(txid, decision)
 		if txid in self.pending_2pc:
 			del self.pending_2pc[txid]
-		if role == 'COORD' and txid in self.decision_outbox:
-			del self.decision_outbox[txid]
+		if role == 'COORD' and self.status == 'LEADER':
+			ensure_coord_decision_outbox(txid, decision)
+			send_coord_decision(txid, force=True)
+		elif role == 'PART' and self.status == 'LEADER':
+			targets = coord_target_nodes(meta)
+			if targets:
+				send(('DECISION_ACK', txid), to=targets)
 
 	def cleanup_tx(txid):
 		release_locks(txid)
@@ -1657,22 +1633,141 @@ class Node(process):
 			return 'PREPARED_ABORT'
 		return None
 
+	def proc_cluster_id(proc):
+		name = self.proc_to_name.get(proc)
+		if not name or not name.startswith('n'):
+			return None
+		try:
+			idx = int(name[1:])
+		except Exception:
+			return None
+		return ((idx - 1) // CLUSTER_CONFIG['nodes_per_cluster']) + 1
+
+	def participant_shards_for_meta(meta):
+		if not meta:
+			return ()
+		parts = meta.get('participants', ()) or ()
+		if isinstance(parts, set):
+			parts = tuple(sorted(parts))
+		elif isinstance(parts, list):
+			parts = tuple(parts)
+		elif not isinstance(parts, tuple):
+			try:
+				parts = tuple(parts)
+			except Exception:
+				parts = ()
+		if not parts and meta.get('tx') and len(meta.get('tx')) >= 2:
+			coord_shard = meta.get('coord_shard') or self.cluster_id
+			dst_shard = shard_for(meta.get('tx')[1])
+			if dst_shard != coord_shard:
+				parts = (dst_shard,)
+				meta['participants'] = parts
+		return parts
+
+	def decision_target_nodes(meta):
+		targets = set()
+		for shard in participant_shards_for_meta(meta):
+			targets |= set(self.cluster_map.get(shard, set()))
+		return targets
+
+	def coord_target_nodes(meta, fallback_proc=None):
+		coord_shard = meta.get('coord_shard') if meta else None
+		if coord_shard is None and fallback_proc is not None:
+			coord_shard = proc_cluster_id(fallback_proc)
+		targets = set(self.cluster_map.get(coord_shard, set())) if coord_shard else set()
+		if not targets and fallback_proc is not None:
+			targets = {fallback_proc}
+		return targets
+
+	def build_client_reply(meta, decision):
+		reply = decision
+		if decision == 'COMMIT' and meta and meta.get('tx'):
+			tx = meta.get('tx')
+			if isinstance(tx, tuple) and len(tx) >= 3:
+				src, dst, _amt = tx[0], tx[1], tx[2]
+				write_info = {src: self.db.get(src, INITIAL_BALANCE)}
+				pw = meta.get('part_write') if isinstance(meta.get('part_write'), dict) else {}
+				for k, v in (pw or {}).items():
+					write_info[int(k)] = v
+				reply = ('COMMIT', write_info)
+		return reply
+
 	def maybe_reply_client(txid, decision):
 		meta = self.tx_meta.get(txid)
+		reply = build_client_reply(meta, decision)
+		self.client_replies[txid] = reply
 		client = meta.get('client') if meta else None
 		if client:
-			reply = decision
-			if decision == 'COMMIT' and meta and meta.get('tx'):
-				tx = meta.get('tx')
-				if isinstance(tx, tuple) and len(tx) >= 3:
-					src, dst, _amt = tx[0], tx[1], tx[2]
-					write_info = {src: self.db.get(src, INITIAL_BALANCE)}
-					pw = meta.get('part_write') if isinstance(meta.get('part_write'), dict) else {}
-					for k, v in (pw or {}).items():
-						write_info[int(k)] = v
-					reply = ('COMMIT', write_info)
-			self.client_replies[txid] = reply
 			send(('TX_RESULT', txid, reply), to=client)
+		return reply
+
+	def start_coord_phase2(txid, decision):
+		meta = self.tx_meta.get(txid)
+		if not meta or meta.get('decision'):
+			return False
+		existing = meta.get('coord_phase2_started')
+		if existing:
+			return False
+		seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
+		if seq_c is None:
+			seq_c = self.next_seq
+		meta['commit_seq'] = seq_c
+		meta['coord_phase2_started'] = decision
+		self.tx_meta[txid] = meta
+		if txid in self.pending_2pc:
+			self.pending_2pc[txid]['state'] = 'WAIT_LOCAL_DECISION'
+		propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
+		return True
+
+	def ensure_coord_decision_outbox(txid, decision):
+		meta = self.tx_meta.get(txid)
+		if not meta:
+			return None
+		info = self.decision_outbox.get(txid, {})
+		info['decision'] = decision
+		info['targets'] = decision_target_nodes(meta)
+		info['client'] = meta.get('client')
+		info['client_reply'] = build_client_reply(meta, decision)
+		info['last_sent'] = info.get('last_sent', 0.0)
+		info['client_replied'] = info.get('client_replied', False)
+		self.decision_outbox[txid] = info
+		return info
+
+	def send_coord_decision(txid, force=False):
+		info = self.decision_outbox.get(txid)
+		if not info:
+			return
+		now = time.time()
+		if (not force) and (now - info.get('last_sent', 0.0) < PREPARE_RETRY_INTERVAL):
+			return
+		desc = info.get('decision')
+		targets = info.get('targets', set())
+		if targets:
+			send(('DECISION', txid, desc), to=targets)
+		if info.get('client') and not info.get('client_replied'):
+			reply = info.get('client_reply', desc)
+			self.client_replies[txid] = reply
+			send(('TX_RESULT', txid, reply), to=info.get('client'))
+			info['client_replied'] = True
+		info['last_sent'] = now
+		self.decision_outbox[txid] = info
+
+	def recover_coord_decision_delivery():
+		if self.status != 'LEADER':
+			return
+		for txid, meta in list(self.tx_meta.items()):
+			if not meta or not meta.get('decision'):
+				continue
+			if not meta.get('prepared', {}).get('COORD'):
+				continue
+			if meta.get('participant_ack'):
+				continue
+			if not participant_shards_for_meta(meta):
+				continue
+			created = txid not in self.decision_outbox
+			ensure_coord_decision_outbox(txid, meta.get('decision'))
+			if created:
+				send_coord_decision(txid, force=True)
 
 	# === 2PC Handlers ===
 	def receive(msg=('CLIENT_TX', tx, txid, client), from_=sender):
@@ -1875,7 +1970,7 @@ class Node(process):
 		coord_targets = self.cluster_map.get(coord_shard, set())
 		if final:
 			if coord_targets:
-				send(('DECISION', txid, final), to=coord_targets)
+				send(('DECISION_ACK', txid), to=coord_targets)
 			return
 		# If participant side was already prepared, do not lock/re-propose again.
 		# Re-send PREPARED/ABORT to help coordinator recover.
@@ -1934,9 +2029,9 @@ class Node(process):
 			coord_shard = meta.get('coord_shard')
 			if tx and (coord_shard is None or coord_shard == self.cluster_id):
 				apply_prepare_entry(txid, tx, 'COORD', commit_allowed=True)
-		participants = meta.get('participants', ()) or ()
-		if txid in self.pending_2pc and participants:
-			self.pending_2pc[txid].setdefault('participants_ready', set()).add(next(iter(participants)))
+		ready_parts = set(participant_shards_for_meta(meta))
+		if txid in self.pending_2pc and ready_parts:
+			self.pending_2pc[txid].setdefault('participants_ready', set()).update(ready_parts)
 		coord_shard = meta.get('coord_shard')
 		# DO NOT unconditionally re-broadcast PREPARED - this causes message amplification
 		# The PREPARED was already sent by apply_prepare_entry when the participant prepared
@@ -1947,30 +2042,7 @@ class Node(process):
 				ensure_leader()
 			return
 		if meta['prepared'].get('COORD') and not meta.get('decision'):
-			decision = 'COMMIT'
-			seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
-			if seq_c is None:
-				seq_c = self.next_seq
-			propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
-			participant_shards = meta.get('participants', ())
-			client = meta.get('client')
-			for shard in participant_shards:
-				targets = self.cluster_map.get(shard, set())
-				send(('DECISION', txid, decision), to=targets)
-				# For client RYW cache: include written balances when committing
-				reply = decision
-				if decision == 'COMMIT':
-					tx = meta.get('tx')
-					if tx and len(tx) >= 3:
-						src, dst, _amt = tx[0], tx[1], tx[2]
-						write_info = {src: self.db.get(src, INITIAL_BALANCE)}
-						pw = meta.get('part_write') if isinstance(meta.get('part_write'), dict) else {}
-						for k, v in (pw or {}).items():
-							write_info[int(k)] = v
-						reply = ('COMMIT', write_info)
-				self.decision_outbox[txid] = {'decision': decision, 'client_reply': reply, 'targets': set(targets), 'last_sent': time.time(), 'client': client}
-			if client:
-				send(('TX_RESULT', txid, reply), to=client)
+			start_coord_phase2(txid, 'COMMIT')
 
 	def receive(msg=('ABORT_TX', txid), from_=p):
 		if self.is_failed:
@@ -1984,20 +2056,10 @@ class Node(process):
 				send(('ABORT_TX', txid), to=coord_targets)
 			fresh = self.current_leader if (self.current_leader and (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT) else None
 			if not fresh:
-				self.backlog_decisions.append((txid, 'ABORT'))
+				self.backlog_decisions.append((txid, 'ABORT', 'COORD', None))
 				ensure_leader()
 			return
-		decision = 'ABORT'
-		seq_c = meta.get('commit_seq') or meta.get('prepare_seq') or self.next_seq
-		propose_with_seq(seq_c, ('2PC_DECISION', txid, decision, 'COORD'))
-		participant_shards = meta.get('participants', ())
-		client = meta.get('client')
-		for shard in participant_shards:
-			targets = self.cluster_map.get(shard, set())
-			send(('DECISION', txid, decision), to=targets)
-			self.decision_outbox[txid] = {'decision': decision, 'targets': set(targets), 'last_sent': time.time(), 'client': client}
-		if client:
-			send(('TX_RESULT', txid, decision), to=client)
+		start_coord_phase2(txid, 'ABORT')
 
 	def receive(msg=('DECISION', txid, decision), from_=coord):
 		if self.is_failed:
@@ -2008,22 +2070,35 @@ class Node(process):
 		meta = self.tx_meta.get(txid)
 		if not meta:
 			# Create a stub so we can honor the decision and ack; avoids losing coord replies
-			meta = {'tx': None, 'prepared': {}, 'decision': None, 'prepare_seq': None, 'commit_seq': None, 'client': None, 'participants': (), 'coord_shard': None}
+			meta = {'tx': None, 'prepared': {}, 'decision': None, 'prepare_seq': None, 'commit_seq': None, 'client': None, 'participants': (), 'coord_shard': proc_cluster_id(coord), 'part_write': {}}
+			self.tx_meta[txid] = meta
+		elif meta.get('coord_shard') is None:
+			meta['coord_shard'] = proc_cluster_id(coord)
 			self.tx_meta[txid] = meta
 		if meta.get('decision'):
+			if self.status == 'LEADER' and meta.get('decision') == decision:
+				targets = coord_target_nodes(meta, coord)
+				if targets:
+					send(('DECISION_ACK', txid), to=targets)
 			return
 		if self.status != 'LEADER':
-			self.backlog_decisions.append((txid, decision))
+			self.backlog_decisions.append((txid, decision, 'PART', coord))
 			ensure_leader()
 			return
+		if meta.get('part_phase2_started'):
+			return
+		meta['part_phase2_started'] = decision
+		self.tx_meta[txid] = meta
 		# Use participant's own seq to ensure sequential execution
 		propose(('2PC_DECISION', txid, decision, 'PART'))
-		maybe_reply_client(txid, decision)
-		send(('DECISION_ACK', txid), to=coord)
 
 	def receive(msg=('DECISION_ACK', txid), from_=p):
 		if self.is_failed:
 			return
+		meta = self.tx_meta.get(txid)
+		if meta is not None:
+			meta['participant_ack'] = True
+			self.tx_meta[txid] = meta
 		if txid in self.decision_outbox:
 			del self.decision_outbox[txid]
 
