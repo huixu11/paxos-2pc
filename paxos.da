@@ -9,7 +9,7 @@ import os
 TIMEOUT = 3.0            # Base client/driver timeout
 HEARTBEAT_INTERVAL = 0.5
 HEARTBEAT_TIMEOUT = 1.5   # Allow some slack before suspecting leader failure
-ELECTION_TIMEOUT = 6.0    # Follower election timer tuned for timely failover in tests
+ELECTION_TIMEOUT = 1.5    # Use the same timeout boundary for election and PREPARE buffering
 PREPARE_BACKOFF = 1.0     # Suppress dueling prepares while allowing faster recovery
 PREPARE_RETRY_INTERVAL = 1.0  # Candidate resend interval for PREPARE
 MAX_CANDIDATE_TIME = 2 * ELECTION_TIMEOUT  # Give up and fall back to follower
@@ -72,15 +72,51 @@ def parse_live_nodes(nodes_str):
 
 # Client Process
 class Client(process):
-    def setup(client_id:int, nodes:set, initial_leader):
-        self.client_id = client_id
+    def setup(logical_client_ids:list, nodes:set, node_map:dict, initial_leader_name:str):
         self.nodes = nodes
-        self.leader = initial_leader
-        self.request_id = 0
-        self.pending = None  # (req_id, tx, timestamp)
+        self.node_map = dict(node_map)
+        self.initial_leader_name = initial_leader_name
+        self.client_states = {}
+        self.token_requests = {}
         self.shutdown = False
-        # Minimal startup log
-        log_info(f"Client {client_id} setup with leader {initial_leader}")
+        for cid in logical_client_ids:
+            self.ensure_client_state(cid)
+        log_info(f"Client setup for {len(self.client_states)} logical clients")
+
+    def ensure_client_state(cid):
+        state = self.client_states.get(cid)
+        if state is None:
+            state = {
+                'leader_name': self.initial_leader_name,
+                'next_timestamp': 1,
+                'pending': None,
+                'last_reply': None,
+            }
+            self.client_states[cid] = state
+        return state
+
+    def ballot_rank(ballot):
+        if isinstance(ballot, tuple):
+            if len(ballot) >= 2:
+                return (ballot[0], str(ballot[1]))
+            if len(ballot) == 1:
+                return (ballot[0], '')
+        return (0, str(ballot))
+
+    def resolve_request(tx, stable_token=None):
+        if not tx:
+            return None, None
+        cid = tx[0]
+        state = self.ensure_client_state(cid)
+        if stable_token is not None and stable_token in self.token_requests:
+            req_cid, client_ts = self.token_requests[stable_token]
+            self.ensure_client_state(req_cid)
+            return req_cid, client_ts
+        client_ts = state['next_timestamp']
+        state['next_timestamp'] += 1
+        if stable_token is not None:
+            self.token_requests[stable_token] = (cid, client_ts)
+        return cid, client_ts
     
     def run():
         # Client run loop idle until DONE
@@ -103,48 +139,62 @@ class Client(process):
         send(('TX_RESULT', tx, result), to=parent)
     
     def request_transaction(tx, stable_token=None):
-        if stable_token is None:
-            self.request_id += 1
-            req_id = (self.client_id, self.request_id)
-        else:
-            # Tie request identity to the driver token so TIMEOUT retries are idempotent.
-            req_id = (self.client_id, ('TOKEN', stable_token))
-        timestamp = time.time()
-        started_at = timestamp
-        self.pending = (req_id, tx, timestamp)
-        
+        cid, client_ts = self.resolve_request(tx, stable_token)
+        if cid is None:
+            return "TIMEOUT"
+
+        state = self.ensure_client_state(cid)
+        started_at = time.time()
+        state['pending'] = (client_ts, tx)
         attempts = 0
-        wait_interval = TIMEOUT  # base retry interval
-        
+
         while True:
             if attempts >= CLIENT_MAX_RETRIES or (time.time() - started_at) >= CLIENT_MAX_WAIT:
-                self.pending = None
+                state['pending'] = None
                 return "TIMEOUT"
 
-            # Broadcast to all known nodes to ensure delivery even if leader fails
-            send(('CLIENT_REQUEST', tx, timestamp, self.client_id, req_id, self), to=self.nodes)
+            leader_proc = self.node_map.get(state.get('leader_name'))
+            if attempts == 0 and leader_proc is not None:
+                send(('CLIENT_REQUEST', tx, client_ts, cid, self), to=leader_proc)
+            else:
+                send(('CLIENT_REQUEST', tx, client_ts, cid, self), to=self.nodes)
 
-            # Start a per-attempt timer that sends a local timeout message
             attempt_id = attempts
-            timer = threading.Timer(wait_interval, lambda: send(('CLIENT_TIMEOUT', req_id, attempt_id), to=self))
+            timeout_msg = ('CLIENT_TIMEOUT', cid, client_ts, attempt_id)
+
+            def fire_timeout():
+                send(timeout_msg, to=self)
+
+            timer = threading.Timer(TIMEOUT, fire_timeout)
             timer.start()
 
-            if await(some(received(('CLIENT_REPLY', r_id, _), from_=sender_proc), has= r_id == req_id) or some(received(('CLIENT_TIMEOUT', t_id, t_attempt)), has= t_id == req_id and t_attempt == attempts)):
-                replies = setof((p, res), received(('CLIENT_REPLY', r_id, res), from_=p), r_id == req_id)
+            if await(
+                some(received(('CLIENT_REPLY', r_cid, r_ts, ballot, _), from_=sender_proc), has=r_cid == cid and r_ts == client_ts)
+                or some(received(('CLIENT_TIMEOUT', t_cid, t_ts, t_attempt)), has=t_cid == cid and t_ts == client_ts and t_attempt == attempt_id)
+            ):
+                replies = setof(
+                    (p, ballot, res),
+                    received(('CLIENT_REPLY', r_cid, r_ts, ballot, res), from_=p),
+                    r_cid == cid and r_ts == client_ts,
+                )
                 if replies:
                     timer.cancel()
-                    new_leader, result = replies.pop()
-                    log_debug(f"Client received reply for {req_id} from {new_leader}: {result}")
-                    self.leader = new_leader
-                    self.pending = None
+                    best_reply = None
+                    best_rank = None
+                    for reply in replies:
+                        reply_rank = self.ballot_rank(reply[1])
+                        if best_reply is None or reply_rank > best_rank:
+                            best_reply = reply
+                            best_rank = reply_rank
+                    _sender, ballot, result = best_reply
+                    if isinstance(ballot, tuple) and len(ballot) >= 2 and ballot[1] in self.node_map:
+                        state['leader_name'] = ballot[1]
+                    state['pending'] = None
+                    state['last_reply'] = (client_ts, ballot, result)
                     return result
-            
+
             timer.cancel()
             attempts += 1
-            # If we have been retrying for a while, nudge nodes to elect a leader
-            if attempts % CLIENT_FORCE_ELECTION_EVERY_ATTEMPTS == 0:
-                send(('FORCE_ELECTION',), to=self.nodes)
-            continue
 
 # Driver process to orchestrate test sets with proper awaits
 class Driver(process):
@@ -175,7 +225,7 @@ class Driver(process):
         # Initialize known clients/balances on all nodes
         if self.all_clients:
             send(('INIT_CLIENTS', list(self.all_clients)), to=self.nodes)
-        
+
         # Create reverse map from process to name
         self.reverse_node_map = {v: k for k, v in self.node_map.items()}
         
@@ -494,10 +544,10 @@ class Node(process):
         # Paxos state
         self.is_initial_leader = is_initial_leader
         # Ballot format: (num, node_name, process) - node_name ensures deterministic tie-breaking
-        self.ballot_num = (1, node_name, self) if is_initial_leader else (0, node_name, self)
-        self.status = 'LEADER' if is_initial_leader else 'FOLLOWER'
-        self.leader = self if is_initial_leader else None
-        self.current_leader = self if is_initial_leader else None  # Track current leader
+        self.ballot_num = (0, node_name, self)
+        self.status = 'FOLLOWER'
+        self.leader = None
+        self.current_leader = None  # Track current leader
 
         
         # Logs
@@ -523,12 +573,13 @@ class Node(process):
 
         
         # Client tracking for exactly-once
-        self.client_replies = {}  # (client_id, req_id) -> (client_proc, result)
-        self.pending_requests = set()  # Set of (client_id, req_id) being processed
-        self.sent_replies = set()      # Track replies already sent to clients
+        self.client_replies = {}        # (client_id, client_ts) -> result
+        self.client_last_reply_ts = {}  # client_id -> highest replied timestamp
+        self.pending_requests = set()   # Set of (client_id, client_ts) being processed
+        self.sent_replies = set()       # Track leader replies already sent to clients
         # Buffer client requests seen while not leader so we can propose them after election
-        self.deferred_requests = {}  # (client_id, req_id) -> (tx, timestamp, client_proc)
-        self.failed_nodes = set()    # Nodes marked failed (ignore their leadership traffic)
+        self.deferred_requests = {}     # (client_id, client_ts) -> (tx, client_proc)
+        self.failed_nodes = set()       # Nodes marked failed (ignore their leadership traffic)
         
         # Failure state
         self.is_failed = False
@@ -563,8 +614,11 @@ class Node(process):
                     await(self.pause_no_quorum == False)
                     continue
                 # Unconditionally send heartbeat, then sleep for interval (receives are handled by handlers)
+                now = time.time()
                 if self.live_peers:
                     send(('HEARTBEAT', self.ballot_num, self), to=self.live_peers)
+                self.last_leader_msg = now
+                self.last_election_time = now
                 # Retry any slots without majority ACCEPTED votes
                 retry_targets = []
                 for (b, seq, val) in list(self.accept_log):
@@ -637,7 +691,7 @@ class Node(process):
         if self.is_failed:
             return
         # If最近收到过leader相关消息（心跳/接受等），避免误判超时
-        if (time.time() - self.last_leader_msg) < HEARTBEAT_TIMEOUT:
+        if not timer_has_expired():
             return
         if time.time() < self.recover_quiet_until:
             return
@@ -648,7 +702,7 @@ class Node(process):
         if self.buffered_prepare:
             b, proposer = self.buffered_prepare
             self.buffered_prepare = None
-            if b > self.ballot_num:
+            if b >= self.ballot_num:
                 accept_prepare(b, proposer)
                 return
         
@@ -732,16 +786,17 @@ class Node(process):
         now = time.time()
         self.last_prepare_received_time = now
 
-        # LEADER in grace period ignores all PREPAREs to stabilize leadership
-        if self.status == 'LEADER' and now < self.leader_grace_until:
+        # Per spec, a node buffers PREPAREs while its timer is still active and
+        # only accepts the highest ballot once the timer has actually expired.
+        if not timer_has_expired():
+            if self.buffered_prepare is None or b > self.buffered_prepare[0]:
+                self.buffered_prepare = (b, p)
             return
 
-        # Acknowledge any equal-or-higher ballot immediately to avoid dueling prepares
         if b >= self.ballot_num:
             accept_prepare(b, p)
             return
 
-        # Lower ballot: remember the best we've seen
         if self.buffered_prepare is None or b > self.buffered_prepare[0]:
             self.buffered_prepare = (b, p)
     
@@ -796,7 +851,9 @@ class Node(process):
                         key = (self.ballot_num, seq)
                         self.accepted_votes[key] = {self}
                         if isinstance(val, tuple) and len(val) >= 4:
-                            self.pending_requests.add((val[2], val[3]))
+                            request_key = (val[2], val[1])
+                            if request_key not in self.client_replies:
+                                self.pending_requests.add(request_key)
                         if seq >= self.next_seq:
                             self.next_seq = seq + 1
                         new_items.append((seq, val))
@@ -810,7 +867,9 @@ class Node(process):
                             key = (self.ballot_num, seq)
                             self.accepted_votes[key] = {self}
                             if isinstance(val, tuple) and len(val) >= 4:
-                                self.pending_requests.add((val[2], val[3]))
+                                request_key = (val[2], val[1])
+                                if request_key not in self.client_replies:
+                                    self.pending_requests.add(request_key)
                             new_items.append((seq, val))
 
                 if new_items and self.live_peers:
@@ -922,8 +981,8 @@ class Node(process):
         if self.deferred_requests:
             pending = list(self.deferred_requests.items())
             self.deferred_requests = {}
-            for (cid, req_id), (tx, ts, client_proc) in pending:
-                propose_client_request(tx, ts, cid, req_id, client_proc)
+            for (cid, client_ts), (tx, client_proc) in pending:
+                propose_client_request(tx, client_ts, cid, client_proc)
     
     def receive(msg=('NEW-VIEW', b, new_log), from_=leader):
         if self.is_failed:
@@ -975,56 +1034,66 @@ class Node(process):
             self.status = 'FOLLOWER'
 
     # === Normal Operations ===
-    
-    def propose_client_request(tx, timestamp, cid, req_id, client_proc):
-        # Do nothing if already in-flight or answered
-        if (cid, req_id) in self.client_replies or (cid, req_id) in self.pending_requests:
+
+    def reply_to_client(cid, timestamp, client_proc, result):
+        send(('CLIENT_REPLY', cid, timestamp, self.ballot_num, result), to=client_proc)
+
+    def propose_client_request(tx, timestamp, cid, client_proc):
+        request_key = (cid, timestamp)
+        if timestamp < self.client_last_reply_ts.get(cid, -1):
+            return
+        if request_key in self.client_replies or request_key in self.pending_requests:
             return
 
-        self.pending_requests.add((cid, req_id))
+        self.pending_requests.add(request_key)
 
         seq = self.next_seq
         self.next_seq += 1
 
-        val = (tx, timestamp, cid, req_id, client_proc)
+        val = (tx, timestamp, cid, client_proc)
         self.accept_log.add((self.ballot_num, seq, val))
 
-        send(('ACCEPT', self.ballot_num, seq, val), to=self.live_peers)
+        if self.live_peers:
+            send(('ACCEPT', self.ballot_num, seq, val), to=self.live_peers)
         send(('ACCEPTED', self.ballot_num, seq, val, self), to=self)
 
-    def receive(msg=('CLIENT_REQUEST', tx, timestamp, cid, req_id, client_proc), from_=client_sender):
+    def receive(msg=('CLIENT_REQUEST', tx, timestamp, cid, client_proc), from_=client_sender):
         if self.is_failed:
             return
-        
-        # Suppress verbose request logs; keep minimal errors
-        
-        # Check if already processed
-        if (cid, req_id) in self.client_replies:
-            saved_client_proc, result = self.client_replies[(cid, req_id)]
-            send(('CLIENT_REPLY', req_id, result), to=saved_client_proc)
-            return
-        
-        # Forward to leader if not leader and remember request for replay after election
-        if self.status != 'LEADER':
-            if (cid, req_id) not in self.deferred_requests:
-                self.deferred_requests[(cid, req_id)] = (tx, timestamp, client_proc)
 
-            if not self.live_peers:
-                log_debug(f"{self.node_name} cannot forward CLIENT_REQUEST, live set empty")
-                return
-            send(('CLIENT_REQUEST', tx, timestamp, cid, req_id, client_proc), to=self.live_peers)
-            # If no known leader, kick off election locally
-            if self.leader is None:
+        request_key = (cid, timestamp)
+        last_reply_ts = self.client_last_reply_ts.get(cid, -1)
+
+        if timestamp < last_reply_ts:
+            return
+
+        if request_key in self.client_replies:
+            result = self.client_replies[request_key]
+            reply_to_client(cid, timestamp, client_proc, result)
+            return
+
+        if self.status != 'LEADER':
+            self.deferred_requests[request_key] = (tx, client_proc)
+
+            leader_proc = None
+            if self.current_leader in self.live_peers:
+                leader_proc = self.current_leader
+            elif self.leader in self.live_peers:
+                leader_proc = self.leader
+
+            if leader_proc is not None:
+                send(('CLIENT_REQUEST', tx, timestamp, cid, client_proc), to=leader_proc)
+            elif not self.pause_no_quorum:
                 start_election()
             return
-        
-        # Clear any deferred copy now that we're the leader
-        if (cid, req_id) in self.deferred_requests:
-            del self.deferred_requests[(cid, req_id)]
 
-        propose_client_request(tx, timestamp, cid, req_id, client_proc)
-    
+        if request_key in self.deferred_requests:
+            del self.deferred_requests[request_key]
+
+        propose_client_request(tx, timestamp, cid, client_proc)
+
     def receive(msg=('ACCEPT', b, seq, val), from_=leader):
+
         if self.is_failed:
             return
         if leader in self.failed_nodes:
@@ -1093,11 +1162,12 @@ class Node(process):
                 continue
             if seq <= self.last_executed_seq:
                 continue
-            if isinstance(val, tuple) and len(val) >= 5:
-                tx, ts, cid, req_id, client_proc = val[:5]
-                if (cid, req_id) not in self.client_replies:
-                    self.deferred_requests[(cid, req_id)] = (tx, ts, client_proc)
-                    self.pending_requests.discard((cid, req_id))
+            if isinstance(val, tuple) and len(val) >= 4:
+                tx, ts, cid, client_proc = val[:4]
+                request_key = (cid, ts)
+                if ts >= self.client_last_reply_ts.get(cid, -1) and request_key not in self.client_replies:
+                    self.deferred_requests[request_key] = (tx, client_proc)
+                    self.pending_requests.discard(request_key)
 
         # Bump our ballot above the highest seen so the next election is unique
         next_num = max(b_key[0], self.ballot_num[0]) + 1 if isinstance(b_key, tuple) else self.ballot_num[0] + 1
@@ -1153,65 +1223,64 @@ class Node(process):
             if val == 'NO-OP':
                 self.last_executed_seq = seq
                 continue
-            
-            # val is (tx, timestamp, cid, req_id, client_proc)
-            tx, timestamp, cid, req_id, client_proc = val
+
+            tx, timestamp, cid, client_proc = val
+            request_key = (cid, timestamp)
 
             # Exactly-once at execution: the same client request may appear again
             # in a later slot after view changes/retries. Do not mutate state twice.
-            if (cid, req_id) in self.client_replies:
-                _, cached_result = self.client_replies[(cid, req_id)]
-                result = cached_result
-                if (cid, req_id) not in self.sent_replies:
-                    send(('CLIENT_REPLY', req_id, result), to=client_proc)
-                    self.sent_replies.add((cid, req_id))
-                self.pending_requests.discard((cid, req_id))
+            if request_key in self.client_replies:
+                result = self.client_replies[request_key]
+                self.pending_requests.discard(request_key)
+                if self.status == 'LEADER' and request_key not in self.sent_replies:
+                    reply_to_client(cid, timestamp, client_proc, result)
+                    self.sent_replies.add(request_key)
                 self.last_executed_seq = seq
                 continue
-            
-            # Execute transaction
+
             if len(tx) == 3:  # Transfer (sender, receiver, amount)
                 sender, receiver, amount = tx
                 self.known_clients.add(sender)
                 self.known_clients.add(receiver)
-                
+
                 sender_bal = self.db.get(sender, 10)
                 receiver_bal = self.db.get(receiver, 10)
-                
+
                 if sender_bal >= amount:
                     self.db[sender] = sender_bal - amount
                     self.db[receiver] = receiver_bal + amount
-                    result = "SUCCESS"
+                    result = 'SUCCESS'
                 else:
-                    result = "INSUFFICIENT_FUNDS"
-            
+                    result = 'INSUFFICIENT_FUNDS'
+
             elif len(tx) == 1:  # Balance query
                 client_id = tx[0]
                 self.known_clients.add(client_id)
                 balance = self.db.get(client_id, 10)
-                result = f"BALANCE:{balance}"
-            
+                result = f'BALANCE:{balance}'
+
             else:
-                result = "UNKNOWN_TX"
-            
+                result = 'UNKNOWN_TX'
+
             log_debug(f"{self.node_name} EXECUTED seq={seq}, tx={tx}, result={result}")
-            
-            # Store result for exactly-once (store client_proc and result)
-            self.client_replies[(cid, req_id)] = (client_proc, result)
-            
-            # Remove from pending set
-            self.pending_requests.discard((cid, req_id))
-            
-            # Send reply (leader or backup) once
-            if (cid, req_id) not in self.sent_replies:
-                # Debug: trace replies to verify client sees them
-                log_debug(f"{self.node_name} sending CLIENT_REPLY for {req_id} result={result} to {client_proc}")
-                send(('CLIENT_REPLY', req_id, result), to=client_proc)
-                self.sent_replies.add((cid, req_id))
-            
+
+            self.client_replies[request_key] = result
+            if timestamp > self.client_last_reply_ts.get(cid, -1):
+                self.client_last_reply_ts[cid] = timestamp
+
+            self.pending_requests.discard(request_key)
+
+            # Only the leader sends the first reply after commit; backups answer
+            # duplicate client retries from receive(CLIENT_REQUEST).
+            if self.status == 'LEADER' and request_key not in self.sent_replies:
+                log_debug(f"{self.node_name} sending CLIENT_REPLY for {(cid, timestamp)} result={result} to {client_proc}")
+                reply_to_client(cid, timestamp, client_proc, result)
+                self.sent_replies.add(request_key)
+
             self.last_executed_seq = seq
-    
+
     # === Failure Handling ===
+
     
     def receive(msg=('FAIL',)):
         self.is_failed = True
@@ -1395,9 +1464,10 @@ class Node(process):
     
     def receive(msg=('RESET',)):
         log_info(f"{self.node_name} RESET. Peers: {len(self.peers)}")
-        self.ballot_num = (1, self.node_name, self) if self.is_initial_leader else (0, self.node_name, self)
-        self.status = 'LEADER' if self.is_initial_leader else 'FOLLOWER'
-        self.leader = self if self.is_initial_leader else None
+        self.ballot_num = (0, self.node_name, self)
+        self.status = 'FOLLOWER'
+        self.leader = None
+        self.current_leader = None
         self.accept_log = set()
         self.committed_log = {}
         self.promises = {}
@@ -1407,11 +1477,21 @@ class Node(process):
         # self.db = {}  # Preserved for Project 1
         # self.known_clients = set() # Preserved for Project 1
         self.client_replies = {}
+        self.client_last_reply_ts = {}
+        self.pending_requests = set()
+        self.sent_replies = set()
+        self.deferred_requests = {}
+        self.failed_nodes = set()
         self.is_failed = False
+        self.recover_quiet_until = 0.0
+        self.pause_no_quorum = False
         self.new_view_messages = []
         self.last_leader_msg = time.time()
         self.buffered_prepare = None
         self.last_prepare_received_time = 0.0
+        self.last_election_time = 0.0
+        self.candidate_start_time = 0.0
+        self.leader_grace_until = 0.0
     
     # === Print Functions ===
     
@@ -1466,13 +1546,13 @@ def main():
     nodes = new(Node, num=5)
     nodes_list = list(nodes)
     
-    for i, node in enumerate(nodes_list):
-        setup(node, (node_names[i], set(nodes_list), i == 0))
-    
-    start(nodes)
-    
     # Map node names to processes
     node_map = {name: node for name, node in zip(node_names, nodes_list)}
+
+    for i, node in enumerate(nodes_list):
+        setup(node, (node_names[i], set(nodes_list), False))
+    
+    start(nodes)
     
     # Read CSV file
     test_sets = []
@@ -1523,10 +1603,14 @@ def main():
         
         if current_set:
             test_sets.append(current_set)
-    
+
+    # Project 1 assumes 10 logical clients/accounts (A-J) exist even if a
+    # particular input file only touches a subset of them.
+    all_clients.update(tuple('ABCDEFGHIJ'))
+
     # Create client
     client = new(Client, num=1)
-    setup(client, (0, set(nodes_list), nodes_list[0]))
+    setup(client, (sorted(list(all_clients), key=str), set(nodes_list), node_map, 'n1'))
     start(client)
 
     # Create driver
