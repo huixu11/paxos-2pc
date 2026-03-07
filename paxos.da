@@ -279,6 +279,8 @@ class Driver(process):
         self.nodes = nodes
         self.client = client_proc
         self.all_clients = all_clients
+        self.view_messages_by_set = {}
+        self.last_known_leader_name = None
         val = os.environ.get('REPORT_AUTOPRINT', '')
         self.report_autoprint = val.lower() in ('1', 'true', 'yes')
         interactive = False
@@ -294,6 +296,33 @@ class Driver(process):
         self.skip_next_set = False
         self.stop_requested = False
         self.batch_mode = (not self.prompt_sets) and (not self.report_autoprint)
+
+    def reset_view_messages(set_id):
+        self.view_messages_by_set[str(set_id)] = []
+
+    def record_view_message(set_id, nv_msg):
+        sid = str(set_id)
+        bucket = self.view_messages_by_set.get(sid)
+        if bucket is None:
+            bucket = []
+            self.view_messages_by_set[sid] = bucket
+
+        msg_key = repr(nv_msg)
+        for existing_key, _existing_msg in bucket:
+            if existing_key == msg_key:
+                break
+        else:
+            bucket.append((msg_key, nv_msg))
+
+        if isinstance(nv_msg, tuple) and len(nv_msg) >= 2:
+            ballot = nv_msg[1]
+            if isinstance(ballot, tuple) and len(ballot) >= 2:
+                self.last_known_leader_name = ballot[1]
+
+    def emit_view_output(set_id):
+        prefix = f"Set {set_id} | " if set_id is not None else ""
+        for _msg_key, nv_msg in self.view_messages_by_set.get(str(set_id), []):
+            output(f"{prefix}View: {nv_msg}")
     
     def run():
         # Initialize known clients/balances on all nodes
@@ -302,6 +331,7 @@ class Driver(process):
 
         # Create reverse map from process to name
         self.reverse_node_map = {v: k for k, v in self.node_map.items()}
+        send(('INIT_DRIVER', self), to=self.nodes)
         
         def push_live_set(live_nodes_set):
             live_procs = set(self.node_map[n] for n in live_nodes_set)
@@ -344,8 +374,7 @@ class Driver(process):
                 time.sleep(PRINT_PROPAGATION_WAIT)
 
             if sid in view_sets:
-                send(('PRINT_VIEW', set_id), to=self.nodes)
-                time.sleep(PRINT_PROPAGATION_WAIT)
+                self.emit_view_output(set_id)
 
             ln = log_node.get(sid)
             if ln and ln in self.node_map:
@@ -360,6 +389,7 @@ class Driver(process):
                 log_info(f"Skipping set {test_set['id']} (user request)")
                 self.skip_next_set = False
                 continue
+            self.reset_view_messages(test_set['id'])
             send(('START_SET', test_set['id']), to=self.nodes)
             log_info(f"=== Processing Set {test_set['id']} ===")
             set_started = time.time()
@@ -406,7 +436,10 @@ class Driver(process):
             if not quorum_met:
                 log_info(f"WARNING: Only {live_count()} live nodes - Quorum NOT met, skipping transactions")
             
-            current_leader_name = sorted(list(live_nodes_set))[0] if live_nodes_set else None
+            if self.last_known_leader_name in live_nodes_set:
+                current_leader_name = self.last_known_leader_name
+            else:
+                current_leader_name = sorted(list(live_nodes_set))[0] if live_nodes_set else None
             
             # Process transactions sequentially
             for tx_type, tx_data in test_set['transactions']:
@@ -424,7 +457,9 @@ class Driver(process):
                     if tx_data == ('LF',):
                         log_debug("Executing LF (Leader Fail)")
                         leader_to_fail = None
-                        if current_leader_name and current_leader_name in live_nodes_set:
+                        if self.last_known_leader_name in live_nodes_set:
+                            leader_to_fail = self.last_known_leader_name
+                        elif current_leader_name and current_leader_name in live_nodes_set:
                             leader_to_fail = current_leader_name
                         elif live_nodes_set:
                             leader_to_fail = sorted(list(live_nodes_set))[0]
@@ -432,9 +467,11 @@ class Driver(process):
                         if leader_to_fail:
                             send(('FAIL_LEADER',), to=self.node_map[leader_to_fail])
                             live_nodes_set.discard(leader_to_fail)
+                            if self.last_known_leader_name == leader_to_fail:
+                                self.last_known_leader_name = None
                             log_info(f"LF killed leader {leader_to_fail}")
                         
-                        # First update live set so nodes have correct peer_names for tie-breaking
+                        # First update live set so nodes have the latest live membership snapshot
                         push_live_set(live_nodes_set)
                         time.sleep(SET_LIVE_SETTLE_WAIT)  # Brief wait for SET_LIVE to be processed
                         
@@ -447,7 +484,10 @@ class Driver(process):
                         if not quorum_met:
                             log_info(f"WARNING: LF reduced live nodes to {live_count()} - Quorum NOT met, remaining TX skipped")
                         else:
-                            current_leader_name = sorted(list(live_nodes_set))[0] if live_nodes_set else None
+                            if self.last_known_leader_name in live_nodes_set:
+                                current_leader_name = self.last_known_leader_name
+                            else:
+                                current_leader_name = sorted(list(live_nodes_set))[0] if live_nodes_set else None
                         # Give the cluster time to elect a new leader before next request.
                         time.sleep(LF_STABILIZE_WAIT)
                         continue
@@ -561,8 +601,7 @@ class Driver(process):
                         time.sleep(PRINT_PROPAGATION_WAIT)
                         continue
                     if lower in ('printview', 'view'):
-                        send(('PRINT_VIEW', test_set['id']), to=self.nodes)
-                        time.sleep(PRINT_PROPAGATION_WAIT)
+                        self.emit_view_output(test_set['id'])
                         continue
                     if lower.startswith('printstatus'):
                         payload = cmd.replace('PrintStatus', '').replace('printstatus', '').replace('(', '').replace(')', '').strip()
@@ -603,6 +642,9 @@ class Driver(process):
         # Also stop the client explicitly in case DONE was missed
         send(('STOP',), to=self.client)
         # Driver exits; runtime will join child processes
+
+    def receive(msg=('VIEW_EVENT', set_id, nv_msg)):
+        self.record_view_message(set_id, nv_msg)
 
 # Node Process
 class Node(process):
@@ -672,6 +714,7 @@ class Node(process):
         self.new_view_messages = []
         self.request_trace = {}
         self.current_test_set = None
+        self.report_driver = None
 
         # Mapping of peer processes to their node names (for tie-breaking)
         self.peer_names = {}  # process -> node_name
@@ -852,28 +895,6 @@ class Node(process):
         
         start_election()
     
-    def should_i_lead():
-        """Deterministic tie-breaker: only lowest node_name among live nodes starts elections."""
-        # If peer_names not populated yet, don't start election
-        if not self.peer_names:
-            return False
-        
-        # Get names of all live peers from the peer_names mapping
-        live_peer_names = set()
-        for p in self.live_peers:
-            if p in self.peer_names:
-                live_peer_names.add(self.peer_names[p])
-        
-        # If we couldn't find any live peer names, wait for SET_LIVE
-        if not live_peer_names and self.live_peers:
-            return False
-        
-        # If we're the lowest node_name, we should lead
-        for name in live_peer_names:
-            if name < self.node_name:
-                return False  # Someone with higher priority (lower name) exists
-        return True
-
     def start_election():
         if self.is_failed:
             return
@@ -891,12 +912,6 @@ class Node(process):
         if (now - self.last_prepare_received_time) < PREPARE_BACKOFF:
             self.status = 'FOLLOWER'
             # Reset timer baseline to avoid tight retry loops when backoff triggers
-            self.last_leader_msg = time.time()
-            return
-
-        # Deterministic tie-breaking: only start election if we have highest priority
-        if not should_i_lead():
-            self.status = 'FOLLOWER'
             self.last_leader_msg = time.time()
             return
 
@@ -1104,6 +1119,8 @@ class Node(process):
         # Send NEW-VIEW and run normal accept/accepted/commit flow.
         nv_msg = ('NEW-VIEW', self.ballot_num, ordered_new_log)
         self.new_view_messages.append(nv_msg)
+        if self.report_driver is not None and self.current_test_set is not None:
+            send(('VIEW_EVENT', self.current_test_set, nv_msg), to=self.report_driver)
         targets = set(self.live_peers)
         if targets:
             send(nv_msg, to=targets)
@@ -1599,6 +1616,9 @@ class Node(process):
             self.known_clients.add(c)
             if c not in self.db:
                 self.db[c] = 10
+
+    def receive(msg=('INIT_DRIVER', driver_proc)):
+        self.report_driver = driver_proc
 
     def receive(msg=('SET_LIVE', live_set, name_mapping)):
         # live_set is a set of node processes, name_mapping is process -> node_name
