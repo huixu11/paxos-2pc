@@ -30,7 +30,8 @@ POST_SET_QUIET_WINDOW = 0.20
 LF_STABILIZE_WAIT = 1.0
 
 # Logging controls
-VERBOSE_LOG = False       # Set True for detailed protocol tracing
+VERBOSE_LOG = os.environ.get('PAXOS_VERBOSE_LOG', '').lower() in ('1', 'true', 'yes', 'on')
+INFO_LOG = os.environ.get('PAXOS_INFO_LOG', '').lower() in ('1', 'true', 'yes', 'on')
 
 
 # Minimal wrappers to centralize log filtering
@@ -46,7 +47,8 @@ def log_debug(msg:str):
         _emit(msg)
 
 def log_info(msg:str):
-    _emit(msg)
+    if INFO_LOG:
+        _emit(msg)
 
 
 
@@ -70,6 +72,25 @@ def parse_live_nodes(nodes_str):
     nodes_str = nodes_str.strip().strip('[]')
     return [n.strip() for n in nodes_str.split(',')]
 
+def ballot_identity(ballot):
+    if isinstance(ballot, tuple):
+        if len(ballot) >= 2:
+            return (ballot[0], str(ballot[1]))
+        if len(ballot) == 1:
+            return (ballot[0], '')
+    return (0, str(ballot))
+
+def format_ballot(ballot):
+    bid = ballot_identity(ballot)
+    return f'({bid[0]}, {bid[1]})'
+
+def format_tx(tx):
+    if tx == 'NO-OP':
+        return 'NO-OP'
+    if isinstance(tx, tuple):
+        return '(' + ', '.join(str(part) for part in tx) + ')'
+    return str(tx)
+
 # Client Process
 class Client(process):
     def setup(logical_client_ids:list, nodes:set, node_map:dict, initial_leader_name:str):
@@ -78,6 +99,9 @@ class Client(process):
         self.initial_leader_name = initial_leader_name
         self.client_states = {}
         self.token_requests = {}
+        self.active_requests = {}
+        self.completed_tokens = {}
+        self.completed_requests = {}
         self.shutdown = False
         for cid in logical_client_ids:
             self.ensure_client_state(cid)
@@ -89,19 +113,12 @@ class Client(process):
             state = {
                 'leader_name': self.initial_leader_name,
                 'next_timestamp': 1,
-                'pending': None,
+                'pending_key': None,
+                'queue': [],
                 'last_reply': None,
             }
             self.client_states[cid] = state
         return state
-
-    def ballot_rank(ballot):
-        if isinstance(ballot, tuple):
-            if len(ballot) >= 2:
-                return (ballot[0], str(ballot[1]))
-            if len(ballot) == 1:
-                return (ballot[0], '')
-        return (0, str(ballot))
 
     def resolve_request(tx, stable_token=None):
         if not tx:
@@ -124,77 +141,134 @@ class Client(process):
         await(some(received(('DONE',))) or some(received(('STOP',))))
         self.shutdown = True
         log_debug("Client finishing")
+
+    def arm_timer(request_key):
+        active = self.active_requests.get(request_key)
+        if active is None:
+            return
+        active['timer_generation'] += 1
+        generation = active['timer_generation']
+        cid, client_ts = request_key
+
+        def fire_timeout():
+            send(('CLIENT_TIMEOUT', cid, client_ts, generation), to=self)
+
+        timer = threading.Timer(TIMEOUT, fire_timeout)
+        timer.start()
+
+    def dispatch_request(request_key, broadcast=False):
+        active = self.active_requests.get(request_key)
+        if active is None:
+            return
+        cid, client_ts = request_key
+        state = self.ensure_client_state(cid)
+        tx = active['tx']
+        leader_proc = self.node_map.get(state.get('leader_name'))
+        if not broadcast and leader_proc is not None:
+            send(('CLIENT_REQUEST', tx, client_ts, cid, self), to=leader_proc)
+        else:
+            send(('CLIENT_REQUEST', tx, client_ts, cid, self), to=self.nodes)
+        arm_timer(request_key)
+
+    def maybe_start_next(cid):
+        state = self.ensure_client_state(cid)
+        if state.get('pending_key') is not None:
+            return
+        if not state['queue']:
+            return
+        queued = state['queue'].pop(0)
+        tx, response_token, requester, stable_token = queued
+        start_request(tx, response_token, requester, stable_token)
+
+    def finalize_request(request_key, result, ballot=None):
+        active = self.active_requests.pop(request_key, None)
+        if active is None:
+            return
+
+        cid, client_ts = request_key
+        state = self.ensure_client_state(cid)
+        if isinstance(ballot, tuple) and len(ballot) >= 2 and ballot[1] in self.node_map:
+            state['leader_name'] = ballot[1]
+        state['pending_key'] = None
+        state['last_reply'] = (client_ts, ballot, result)
+        self.completed_requests[request_key] = (ballot, result)
+
+        stable_token = active.get('stable_token')
+        if stable_token is not None:
+            self.completed_tokens[stable_token] = result
+
+        send(('TX_RESULT', active['response_token'], result), to=active['requester'])
+        maybe_start_next(cid)
+
+    def start_request(tx, response_token, requester, stable_token=None):
+        cid, client_ts = self.resolve_request(tx, stable_token)
+        if cid is None:
+            send(('TX_RESULT', response_token, 'TIMEOUT'), to=requester)
+            return
+
+        if stable_token is not None and stable_token in self.completed_tokens:
+            send(('TX_RESULT', response_token, self.completed_tokens[stable_token]), to=requester)
+            return
+
+        request_key = (cid, client_ts)
+        state = self.ensure_client_state(cid)
+        pending_key = state.get('pending_key')
+
+        if pending_key is not None and pending_key != request_key:
+            state['queue'].append((tx, response_token, requester, stable_token))
+            return
+
+        state['pending_key'] = request_key
+        active = self.active_requests.get(request_key)
+        if active is None:
+            active = {
+                'tx': tx,
+                'response_token': response_token,
+                'requester': requester,
+                'stable_token': stable_token,
+                'started_at': time.time(),
+                'retry_count': 0,
+                'timer_generation': 0,
+            }
+            self.active_requests[request_key] = active
+            dispatch_request(request_key, broadcast=False)
+            return
+
+        active['response_token'] = response_token
+        active['requester'] = requester
+        if stable_token is not None:
+            active['stable_token'] = stable_token
+        dispatch_request(request_key, broadcast=True)
     
     def receive(msg=('TRIGGER_TX', tx, tx_token), from_=parent):
         log_debug(f"Client triggered for {tx}")
-        result = request_transaction(tx, tx_token)
-        log_debug(f"Client completed {tx} with result {result}")
-        send(('TX_RESULT', tx_token, result), to=parent)
+        start_request(tx, tx_token, parent, tx_token)
 
     # Backward-compatible handler
     def receive(msg=('TRIGGER_TX', tx), from_=parent):
         log_debug(f"Client triggered for {tx}")
-        result = request_transaction(tx)
-        log_debug(f"Client completed {tx} with result {result}")
-        send(('TX_RESULT', tx, result), to=parent)
-    
-    def request_transaction(tx, stable_token=None):
-        cid, client_ts = self.resolve_request(tx, stable_token)
-        if cid is None:
-            return "TIMEOUT"
+        start_request(tx, tx, parent)
 
-        state = self.ensure_client_state(cid)
-        started_at = time.time()
-        state['pending'] = (client_ts, tx)
-        attempts = 0
+    def receive(msg=('CLIENT_REPLY', cid, client_ts, ballot, result), from_=node_proc):
+        request_key = (cid, client_ts)
+        active = self.active_requests.get(request_key)
+        if active is None:
+            return
+        log_debug(f"Client received reply for {request_key} from {node_proc}: {result}")
+        finalize_request(request_key, result, ballot)
 
-        while True:
-            if attempts >= CLIENT_MAX_RETRIES or (time.time() - started_at) >= CLIENT_MAX_WAIT:
-                state['pending'] = None
-                return "TIMEOUT"
-
-            leader_proc = self.node_map.get(state.get('leader_name'))
-            if attempts == 0 and leader_proc is not None:
-                send(('CLIENT_REQUEST', tx, client_ts, cid, self), to=leader_proc)
-            else:
-                send(('CLIENT_REQUEST', tx, client_ts, cid, self), to=self.nodes)
-
-            attempt_id = attempts
-            timeout_msg = ('CLIENT_TIMEOUT', cid, client_ts, attempt_id)
-
-            def fire_timeout():
-                send(timeout_msg, to=self)
-
-            timer = threading.Timer(TIMEOUT, fire_timeout)
-            timer.start()
-
-            if await(
-                some(received(('CLIENT_REPLY', r_cid, r_ts, ballot, _), from_=sender_proc), has=r_cid == cid and r_ts == client_ts)
-                or some(received(('CLIENT_TIMEOUT', t_cid, t_ts, t_attempt)), has=t_cid == cid and t_ts == client_ts and t_attempt == attempt_id)
-            ):
-                replies = setof(
-                    (p, ballot, res),
-                    received(('CLIENT_REPLY', r_cid, r_ts, ballot, res), from_=p),
-                    r_cid == cid and r_ts == client_ts,
-                )
-                if replies:
-                    timer.cancel()
-                    best_reply = None
-                    best_rank = None
-                    for reply in replies:
-                        reply_rank = self.ballot_rank(reply[1])
-                        if best_reply is None or reply_rank > best_rank:
-                            best_reply = reply
-                            best_rank = reply_rank
-                    _sender, ballot, result = best_reply
-                    if isinstance(ballot, tuple) and len(ballot) >= 2 and ballot[1] in self.node_map:
-                        state['leader_name'] = ballot[1]
-                    state['pending'] = None
-                    state['last_reply'] = (client_ts, ballot, result)
-                    return result
-
-            timer.cancel()
-            attempts += 1
+    def receive(msg=('CLIENT_TIMEOUT', cid, client_ts, generation)):
+        request_key = (cid, client_ts)
+        active = self.active_requests.get(request_key)
+        if active is None:
+            return
+        if generation != active.get('timer_generation'):
+            return
+        if (time.time() - active['started_at']) >= CLIENT_MAX_WAIT or active['retry_count'] >= CLIENT_MAX_RETRIES:
+            finalize_request(request_key, 'TIMEOUT')
+            return
+        active['retry_count'] += 1
+        dispatch_request(request_key, broadcast=True)
 
 # Driver process to orchestrate test sets with proper awaits
 class Driver(process):
@@ -595,9 +669,71 @@ class Node(process):
         
         # For PrintView
         self.new_view_messages = []
+        self.request_trace = {}
 
         # Mapping of peer processes to their node names (for tie-breaking)
         self.peer_names = {}  # process -> node_name
+
+    def trace_stage_rank(stage):
+        ranks = {
+            'IGNORED_STALE': 0,
+            'RECEIVED': 1,
+            'DEFERRED': 2,
+            'FORWARDED': 3,
+            'PROPOSED': 4,
+            'NEW_VIEW': 5,
+            'ACCEPTED': 6,
+            'COMMITTED': 7,
+            'EXECUTED': 8,
+            'REPLIED': 9,
+        }
+        return ranks.get(stage, -1)
+
+    def note_request_event(seq, val, stage, ballot=None, result=None):
+        if val == 'NO-OP':
+            trace_key = ('NO-OP', seq)
+            cid = '-'
+            timestamp = '-'
+            tx_repr = 'NO-OP'
+        elif isinstance(val, tuple) and len(val) >= 4:
+            tx, timestamp, cid, _client_proc = val[:4]
+            trace_key = (cid, timestamp)
+            tx_repr = format_tx(tx)
+        else:
+            trace_key = ('RAW', seq, str(val))
+            cid = '-'
+            timestamp = '-'
+            tx_repr = format_tx(val)
+
+        entry = self.request_trace.get(trace_key)
+        if entry is None:
+            entry = {
+                'seqs': set(),
+                'cid': cid,
+                'timestamp': timestamp,
+                'tx': tx_repr,
+                'ballots': set(),
+                'seen_stages': [],
+                'stage': stage,
+                'stage_rank': trace_stage_rank(stage),
+                'result': None,
+            }
+            self.request_trace[trace_key] = entry
+
+        if seq is not None:
+            entry['seqs'].add(seq)
+        if ballot is not None:
+            entry['ballots'].add(format_ballot(ballot))
+        if stage not in entry['seen_stages']:
+            entry['seen_stages'].append(stage)
+
+        rank = trace_stage_rank(stage)
+        if rank >= entry['stage_rank']:
+            entry['stage'] = stage
+            entry['stage_rank'] = rank
+        if result is not None:
+            entry['result'] = result
+
     
     def run():
         while not self.shutdown:
@@ -702,7 +838,7 @@ class Node(process):
         if self.buffered_prepare:
             b, proposer = self.buffered_prepare
             self.buffered_prepare = None
-            if b >= self.ballot_num:
+            if b > self.ballot_num:
                 accept_prepare(b, proposer)
                 return
         
@@ -789,17 +925,17 @@ class Node(process):
         # Per spec, a node buffers PREPAREs while its timer is still active and
         # only accepts the highest ballot once the timer has actually expired.
         if not timer_has_expired():
-            if self.buffered_prepare is None or b > self.buffered_prepare[0]:
+            if b > self.ballot_num and (self.buffered_prepare is None or b > self.buffered_prepare[0]):
                 self.buffered_prepare = (b, p)
             return
 
-        if b >= self.ballot_num:
+        if b > self.ballot_num:
             accept_prepare(b, p)
             return
 
-        if self.buffered_prepare is None or b > self.buffered_prepare[0]:
+        if b > self.ballot_num and (self.buffered_prepare is None or b > self.buffered_prepare[0]):
             self.buffered_prepare = (b, p)
-    
+
     def accept_prepare(b, proposer):
         self.ballot_num = b
         self.status = 'FOLLOWER'
@@ -970,6 +1106,7 @@ class Node(process):
         if targets:
             send(nv_msg, to=targets)
         for (_, seq, val) in ordered_new_log:
+            note_request_event(seq, val, 'NEW_VIEW', self.ballot_num)
             log_debug(f"{self.node_name} sending ACCEPT seq={seq} ballot={self.ballot_num}")
             if targets:
                 send(('ACCEPT', self.ballot_num, seq, val), to=targets)
@@ -1005,6 +1142,7 @@ class Node(process):
             
             # Treat as Accept messages, send ACCEPTED, do not commit/execute yet
             for (ballot, seq, val) in new_log:
+                note_request_event(seq, val, 'NEW_VIEW', b)
                 send(('ACCEPTED', ballot, seq, val, self), to=leader)
     
     # === Heartbeat ===
@@ -1052,6 +1190,7 @@ class Node(process):
 
         val = (tx, timestamp, cid, client_proc)
         self.accept_log.add((self.ballot_num, seq, val))
+        note_request_event(seq, val, 'PROPOSED', self.ballot_num)
 
         if self.live_peers:
             send(('ACCEPT', self.ballot_num, seq, val), to=self.live_peers)
@@ -1063,17 +1202,22 @@ class Node(process):
 
         request_key = (cid, timestamp)
         last_reply_ts = self.client_last_reply_ts.get(cid, -1)
+        incoming_val = (tx, timestamp, cid, client_proc)
+        note_request_event(None, incoming_val, 'RECEIVED', self.ballot_num)
 
         if timestamp < last_reply_ts:
+            note_request_event(None, incoming_val, 'IGNORED_STALE', self.ballot_num)
             return
 
         if request_key in self.client_replies:
             result = self.client_replies[request_key]
+            note_request_event(None, incoming_val, 'REPLIED', self.ballot_num, result)
             reply_to_client(cid, timestamp, client_proc, result)
             return
 
         if self.status != 'LEADER':
             self.deferred_requests[request_key] = (tx, client_proc)
+            note_request_event(None, incoming_val, 'DEFERRED', self.ballot_num)
 
             leader_proc = None
             if self.current_leader in self.live_peers:
@@ -1082,6 +1226,7 @@ class Node(process):
                 leader_proc = self.leader
 
             if leader_proc is not None:
+                note_request_event(None, incoming_val, 'FORWARDED', self.ballot_num)
                 send(('CLIENT_REQUEST', tx, timestamp, cid, client_proc), to=leader_proc)
             elif not self.pause_no_quorum:
                 start_election()
@@ -1107,13 +1252,14 @@ class Node(process):
             self.last_leader_msg = now
             self.last_election_time = now
             self.accept_log.add((b, seq, val))
+            note_request_event(seq, val, 'ACCEPTED', b)
             log_debug(f"{self.node_name} ACCEPT seq={seq} ballot={b} from {leader} live={self.live_cluster_size}")
             send(('ACCEPTED', b, seq, val, self), to=leader)
         else:
             # Reject stale ACCEPT and tell the leader to advance its ballot
             b_key = (self.ballot_num[0], self.ballot_num[1]) if len(self.ballot_num) >= 2 else self.ballot_num
             send(('NACK', b_key), to=leader)
-    
+
     def receive(msg=('ACCEPTED', b, seq, val, node), from_=_):
         # Ballot sent in ACCEPTED may lose the process object, so compare by (num, name)
         msg_key = (b[0], b[1]) if isinstance(b, tuple) and len(b) >= 2 else b
@@ -1204,6 +1350,7 @@ class Node(process):
             request_missing_slots(expected_seq, seq - 1)
 
         self.committed_log[seq] = val
+        note_request_event(seq, val, 'COMMITTED', b)
         # Commit log; executed output handled in execute_committed
         execute_committed()
 
@@ -1221,6 +1368,7 @@ class Node(process):
             val = self.committed_log[seq]
 
             if val == 'NO-OP':
+                note_request_event(seq, val, 'EXECUTED', self.ballot_num, 'NO-OP')
                 self.last_executed_seq = seq
                 continue
 
@@ -1232,9 +1380,11 @@ class Node(process):
             if request_key in self.client_replies:
                 result = self.client_replies[request_key]
                 self.pending_requests.discard(request_key)
+                note_request_event(seq, val, 'EXECUTED', self.ballot_num, result)
                 if self.status == 'LEADER' and request_key not in self.sent_replies:
                     reply_to_client(cid, timestamp, client_proc, result)
                     self.sent_replies.add(request_key)
+                    note_request_event(seq, val, 'REPLIED', self.ballot_num, result)
                 self.last_executed_seq = seq
                 continue
 
@@ -1269,6 +1419,7 @@ class Node(process):
                 self.client_last_reply_ts[cid] = timestamp
 
             self.pending_requests.discard(request_key)
+            note_request_event(seq, val, 'EXECUTED', self.ballot_num, result)
 
             # Only the leader sends the first reply after commit; backups answer
             # duplicate client retries from receive(CLIENT_REQUEST).
@@ -1276,9 +1427,11 @@ class Node(process):
                 log_debug(f"{self.node_name} sending CLIENT_REPLY for {(cid, timestamp)} result={result} to {client_proc}")
                 reply_to_client(cid, timestamp, client_proc, result)
                 self.sent_replies.add(request_key)
+                note_request_event(seq, val, 'REPLIED', self.ballot_num, result)
 
             self.last_executed_seq = seq
 
+    # === Failure Handling ===
     # === Failure Handling ===
 
     
@@ -1486,6 +1639,7 @@ class Node(process):
         self.recover_quiet_until = 0.0
         self.pause_no_quorum = False
         self.new_view_messages = []
+        self.request_trace = {}
         self.last_leader_msg = time.time()
         self.buffered_prepare = None
         self.last_prepare_received_time = 0.0
@@ -1510,8 +1664,28 @@ class Node(process):
     
     def receive(msg=('PRINT_LOG', set_id)):
         prefix = f"Set {set_id} | " if set_id is not None else ""
-        output(f'{prefix}{self.node_name} Log: {sorted(self.accept_log)}')
-    
+        if not self.request_trace:
+            output(f'{prefix}{self.node_name} Log: empty')
+            return
+
+        lines = []
+        for entry in self.request_trace.values():
+            seqs = sorted(list(entry['seqs']))
+            first_seq = seqs[0] if seqs else self.next_seq + self.cluster_size
+            seq_text = ','.join(str(seq) for seq in seqs) if seqs else '-'
+            ballot_text = '[' + ', '.join(sorted(list(entry['ballots']))) + ']' if entry['ballots'] else '[]'
+            seen_text = ','.join(entry['seen_stages']) if entry['seen_stages'] else '-'
+            result_text = entry['result'] if entry['result'] is not None else '-'
+            lines.append((
+                first_seq,
+                str(entry['cid']),
+                str(entry['timestamp']),
+                f"{prefix}{self.node_name} LogEntry seq={seq_text} client={entry['cid']} ts={entry['timestamp']} tx={entry['tx']} stage={entry['stage']} ballots={ballot_text} seen={seen_text} result={result_text}",
+            ))
+
+        for _, _, _, line in sorted(lines):
+            output(line)
+
     def receive(msg=('PRINT_STATUS', seq, set_id)):
         if seq in self.committed_log:
             if seq <= self.last_executed_seq:
