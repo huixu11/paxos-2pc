@@ -31,6 +31,7 @@ NEW_VIEW_CHUNK_SIZE = 16
 ACK_LOG_CHUNK_SIZE = 16
 
 VERBOSE_LOG = False
+INFO_LOG = os.environ.get('PAXOS_INFO_LOG', '').lower() in ('1', 'true', 'yes', 'on')
 INITIAL_BALANCE = 10
 
 
@@ -48,7 +49,8 @@ def log_debug(msg:str):
 
 
 def log_info(msg:str):
-	_emit(msg)
+	if INFO_LOG:
+		_emit(msg)
 
 
 # === Helpers ===
@@ -316,6 +318,33 @@ class Driver(process):
 		# Read-your-writes: track recent writes per key for RYW consistency
 		# client_writes[key] = {'value': balance, 'ts': timestamp}
 		self.client_writes = {}
+		self.view_messages = {}
+
+	def _reset_view_messages(set_id):
+		self.view_messages[str(set_id)] = []
+
+	def _record_view_message(set_id, nv_msg):
+		sid = str(set_id)
+		bucket = self.view_messages.get(sid)
+		if bucket is None:
+			bucket = []
+			self.view_messages[sid] = bucket
+		ballot = nv_msg[1] if isinstance(nv_msg, tuple) and len(nv_msg) >= 2 else None
+		entries = nv_msg[2] if isinstance(nv_msg, tuple) and len(nv_msg) >= 3 else []
+		ballot_key = (ballot[0], ballot[1]) if isinstance(ballot, tuple) and len(ballot) >= 2 else ballot
+		msg_key = (ballot_key, repr(entries))
+		for existing_key, _existing_msg in bucket:
+			if existing_key == msg_key:
+				return
+		bucket.append((msg_key, nv_msg))
+
+	def _print_view(set_id):
+		bucket = self.view_messages.get(str(set_id), [])
+		if not bucket:
+			output(f"Set {set_id} View: []")
+			return
+		for _msg_key, nv_msg in bucket:
+			output(f"Set {set_id} View: {nv_msg}")
 
 	def run():
 		def auto_report_for_set(set_id):
@@ -333,8 +362,7 @@ class Driver(process):
 			elif sid == 3:
 				for k in [6001, 6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010, 6011, 6012, 6013, 6014]:
 					self._print_balance(k)
-				send(('PRINT_VIEW', set_id), to=list(self.all_nodes))
-				time.sleep(TIMEOUT * 0.1)
+				self._print_view(set_id)
 			elif sid == 4:
 				for k in [3001, 3002, 3003, 3004, 3005, 3006]:
 					self._print_balance(k)
@@ -347,18 +375,15 @@ class Driver(process):
 			elif sid == 7:
 				for k in [1, 2, 3, 4, 5, 3001, 3002, 3003, 3004, 6001, 6002, 6003]:
 					self._print_balance(k)
-				send(('PRINT_VIEW', set_id), to=list(self.all_nodes))
-				time.sleep(TIMEOUT * 0.1)
+				self._print_view(set_id)
 			elif sid == 8:
 				for k in [1, 2, 3, 4, 3001, 3002, 3003, 3004, 3005, 6001, 6002, 6003]:
 					self._print_balance(k)
-				send(('PRINT_VIEW', set_id), to=list(self.all_nodes))
-				time.sleep(TIMEOUT * 0.1)
+				self._print_view(set_id)
 			elif sid == 9:
 				for k in [1001, 1002, 1003, 1004, 1005, 4001]:
 					self._print_balance(k)
 				self._do_reshard()
-				send(('PRINT_RESHARD',), to=list(self.all_nodes))
 				time.sleep(TIMEOUT * 0.1)
 				self._print_balance(4001)
 			elif sid == 10:
@@ -368,6 +393,8 @@ class Driver(process):
 					self._print_balance(k)
 				self._print_perf()
 			output(f"REPORT Set {sid} END")
+
+		send(('INIT_DRIVER', self), to=list(self.all_nodes))
 
 		for set_info in self.test_sets:
 			set_id = set_info['id']
@@ -417,6 +444,8 @@ class Driver(process):
 			if acked < len(self.all_nodes):
 				log_info(f"Set {set_id} reset ack timeout: {acked}/{len(self.all_nodes)} (continuing)")
 			self.reset_acks.pop(reset_epoch, None)
+			self._reset_view_messages(set_id)
+			send(('START_SET', set_id), to=list(self.all_nodes))
 			time.sleep(TIMEOUT * 0.2)
 
 			# Apply live set - send live node set to each node for accurate peer tracking
@@ -567,7 +596,6 @@ class Driver(process):
 			avg_lat = (lat_sum / total) if total else 0.0
 			log_info(f"Set {set_id} throughput={throughput:.2f} tx/s avg_lat={avg_lat:.3f}s count={total}")
 			self.stats[set_id] = {'throughput': throughput, 'avg_lat': avg_lat, 'count': total}
-			output(f"Set {set_id} throughput={throughput:.2f} avg_lat={avg_lat:.3f}s count={total}")
 			if self.report_autoprint:
 				auto_report_for_set(set_id)
 
@@ -620,8 +648,7 @@ class Driver(process):
 						output("Usage: PrintStatus(seq)")
 						continue
 					if cmd.lower() in ('printview', 'view'):
-						send(('PRINT_VIEW', set_id), to=list(self.all_nodes))
-						time.sleep(TIMEOUT * 0.1)
+						self._print_view(set_id)
 						continue
 					if cmd.lower() in ('performance', 'perf'):
 						self._print_perf()
@@ -668,6 +695,9 @@ class Driver(process):
 			bucket = set()
 			self.reset_acks[reset_epoch] = bucket
 		bucket.add(node_name)
+
+	def receive(msg=('VIEW_EVENT', set_id, nv_msg)):
+		self._record_view_message(set_id, nv_msg)
 
 	def receive(msg=('PRINT_PERF',)):
 		self._print_perf()
@@ -928,8 +958,8 @@ class Node(process):
 
 		self.new_view_messages = []
 		self.reshard_events = []
-		if self.is_initial_leader:
-			self.new_view_messages.append(('NEW-VIEW', self.ballot_num, []))
+		self.report_driver = None
+		self.current_test_set = None
 
 		self.is_failed = False
 		self.shutdown = False
@@ -1225,6 +1255,8 @@ class Node(process):
 		self.accept_log = set(ordered_new_log)
 		self.next_seq = max(self.next_seq, max_seq + 1)
 		self.new_view_messages.append(('NEW-VIEW', self.ballot_num, ordered_new_log))
+		if self.report_driver is not None and self.current_test_set is not None:
+			send(('VIEW_EVENT', self.current_test_set, ('NEW-VIEW', self.ballot_num, ordered_new_log)), to=self.report_driver)
 		log_debug(f"{self.node_name} become_leader: ballot={self.ballot_num[0]}, new_view_entries={len(ordered_new_log)}, backlog_prepares={len(self.backlog_prepares)}")
 
 		# Phase 2 for NEW-VIEW entries follows normal ACCEPT/ACCEPTED/COMMIT.
@@ -2203,6 +2235,7 @@ class Node(process):
 		self.new_view_chunk_buffer = {}
 		self.new_view_messages = []
 		self.reshard_events = []
+		self.current_test_set = None
 		self.status = 'LEADER' if self.is_initial_leader else 'FOLLOWER'
 		self.ballot_num = (1, self.node_name, self) if self.is_initial_leader else (0, self.node_name, self)
 		self.leader = self if self.is_initial_leader else self.initial_leader_proc
@@ -2214,7 +2247,13 @@ class Node(process):
 		# Set grace period for initial leader to prevent early preemption
 		if self.is_initial_leader:
 			self.leader_grace_until = time.time() + ELECTION_TIMEOUT * 2
-			self.new_view_messages.append(('NEW-VIEW', self.ballot_num, []))
+
+	def receive(msg=('INIT_DRIVER', driver_proc)):
+		self.report_driver = driver_proc
+
+	def receive(msg=('START_SET', set_id)):
+		self.current_test_set = str(set_id)
+		self.new_view_messages = []
 
 	def receive(msg=('RESET',)):
 		reset_local_state()
